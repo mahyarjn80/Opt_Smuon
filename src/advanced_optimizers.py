@@ -4,7 +4,7 @@ Advanced optimizers (Shampoo, Muon, MuonRemez, Adam) implemented as PyTorch opti
 This module provides:
 - Shampoo: Full-matrix preconditioning optimizer
 - Muon: Gradient orthogonalization optimizer
-- MuonRemez: Muon variant using Remez algorithm for matrix fractional powers
+- MuonRemez: Muon variant using coupled Newton-Schulz for matrix square root (Σ^(1/2))
 - Adam: Adaptive moment estimation optimizer (AdamW variant)
 - Configuration classes and utilities for creating optimizers
 """
@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.optim
 
-from src.remez import compute_matrix_fractional_power_remez
+from src.coupled_ns import compute_u_sigma_half_vt
 
 
 Array = Any
@@ -498,14 +498,14 @@ class Muon(torch.optim.Optimizer):
 #############################################
 
 class MuonRemez(torch.optim.Optimizer):
-    r"""Implements Muon Optimizer with Remez Algorithm for Matrix Fractional Powers.
+    r"""Implements Muon Optimizer with Coupled Newton-Schulz for Matrix Square Root.
 
-    Similar to Muon but uses Remez polynomial approximation to compute U·Σ^α·V^T
+    Similar to Muon but uses coupled Newton-Schulz iteration to compute U·Σ^(1/2)·V^T
     instead of Newton-Schulz orthogonalization (which computes Σ^0).
 
     Update rule:
         v_t = β v_{t-1} + (1-β) g_t              (momentum)
-        u_t = matrix_power_remez(v_t, α)         (fractional power via Remez)
+        u_t = compute_u_sigma_half_vt(v_t)       (matrix square root via coupled NS)
         W ← (1 - η*λ) W - η u_t                  (update with weight decay)
 
     Arguments:
@@ -513,21 +513,20 @@ class MuonRemez(torch.optim.Optimizer):
             parameter groups
         lr (float): learning rate (default: 1e-3)
         momentum (float): momentum factor (default: 0.0)
-        alpha (float): fractional power exponent for Remez algorithm (default: 0.5)
         nesterov (bool): whether to use Nesterov momentum (default: False)
         weight_decay (float): weight decay (L2 penalty) (default: 0.0)
-        remez_degree (int): polynomial degree for Remez approximation (default: 15)
+        ns_steps (int): number of coupled Newton-Schulz iterations (default: 5)
 
     Example:
-        >>> optimizer = MuonRemez(model.parameters(), lr=0.001, momentum=0.9, alpha=0.5)
+        >>> optimizer = MuonRemez(model.parameters(), lr=0.001, momentum=0.9)
         >>> optimizer.zero_grad()
         >>> loss_fn(model(input), target).backward()
         >>> optimizer.step()
 
     Note:
         This is a MATRIX optimizer - it works best with 2D+ parameters.
-        The Remez algorithm is applied to parameters reshaped as matrices.
-        alpha=0.0 approximates standard Muon (polar decomposition).
+        The coupled Newton-Schulz method is applied to parameters reshaped as matrices.
+        This computes alpha=0.5 (square root) of singular values.
     """
 
     def __init__(
@@ -535,10 +534,9 @@ class MuonRemez(torch.optim.Optimizer):
         params: Iterable[torch.Tensor],
         lr: float = 1e-3,
         momentum: float = 0.0,
-        alpha: float = 0.5,
         nesterov: bool = False,
         weight_decay: float = 0.0,
-        remez_degree: int = 15,
+        ns_steps: int = 5,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -550,10 +548,9 @@ class MuonRemez(torch.optim.Optimizer):
         defaults = dict(
             lr=lr,
             momentum=momentum,
-            alpha=alpha,
             nesterov=nesterov,
             weight_decay=weight_decay,
-            remez_degree=remez_degree,
+            ns_steps=ns_steps,
         )
         super(MuonRemez, self).__init__(params, defaults)
 
@@ -573,10 +570,9 @@ class MuonRemez(torch.optim.Optimizer):
         for group in self.param_groups:
             lr = group['lr']
             momentum = group['momentum']
-            alpha = group['alpha']
             nesterov = group['nesterov']
             weight_decay = group['weight_decay']
-            remez_degree = group['remez_degree']
+            ns_steps = group['ns_steps']
 
             for p in group['params']:
                 if p.grad is None:
@@ -607,25 +603,25 @@ class MuonRemez(torch.optim.Optimizer):
 
                 #update = update * bias_correction
 
-                # Apply Remez: reshape to 2D, compute M^alpha, reshape back
+                # Apply coupled Newton-Schulz: reshape to 2D, compute U·Σ^(1/2)·V^T, reshape back
                 if len(grad.shape) >= 2:
                     # Reshape to matrix (first dim x product of rest)
                     update_2d = update.view(len(update), -1)
 
-                    # Apply Remez algorithm to compute U·Σ^α·V^T
-                    update_remez_2d = compute_matrix_fractional_power_remez(
-                        update_2d, alpha, degree=remez_degree
+                    # Apply coupled Newton-Schulz to compute U·Σ^(1/2)·V^T
+                    update_sqrt_2d = compute_u_sigma_half_vt(
+                        update_2d, steps=ns_steps, variant='muon_aggressive'
                     )
 
                     # Reshape back
-                    update_remez = update_remez_2d.view(update.shape)
+                    update_sqrt = update_sqrt_2d.view(update.shape)
 
                     # Scale by aspect ratio (from original Muon paper)
                     aspect_ratio = max(1, grad.size(-2) / grad.size(-1))
-                    update_remez *= aspect_ratio ** 0.5
+                    update_sqrt *= aspect_ratio ** 0.5
                 else:
                     # For 1D parameters, just use the update as-is
-                    update_remez = update
+                    update_sqrt = update
 
                 state['step'] += 1
 
@@ -633,7 +629,7 @@ class MuonRemez(torch.optim.Optimizer):
                 p.data.mul_(1 - lr * weight_decay)
 
                 # Apply update
-                p.data.add_(update_remez, alpha=-lr)
+                p.data.add_(update_sqrt, alpha=-lr)
 
         return loss
 
@@ -785,14 +781,12 @@ class MuonRemezConfig:
     Attributes:
         lr: Learning rate
         momentum: Momentum factor for gradient smoothing
-        alpha: Fractional power exponent for Remez algorithm
     """
     lr: float = 0.0005
     momentum: float = 0.9
-    alpha: float = 0.5
 
     def __str__(self):
-        return f"MuonRemez_lr{self.lr}_mom{self.momentum}_alpha{self.alpha}"
+        return f"MuonRemez_lr{self.lr}_mom{self.momentum}"
 
 
 @dataclass
@@ -844,8 +838,8 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
         >>> parse_optimizer_config("Muon:lr=0.0005,momentum=0.9")
         MuonConfig(lr=0.0005, momentum=0.9)
 
-        >>> parse_optimizer_config("MuonRemez:lr=0.0005,momentum=0.9,alpha=0.5")
-        MuonRemezConfig(lr=0.0005, momentum=0.9, alpha=0.5)
+        >>> parse_optimizer_config("MuonRemez:lr=0.0005,momentum=0.9")
+        MuonRemezConfig(lr=0.0005, momentum=0.9)
 
         >>> parse_optimizer_config("Shampoo:lr=0.0005,momentum=0.9,order_multiplier=2")
         ShampooConfig(lr=0.0005, momentum=0.9, order_multiplier=2)
@@ -1016,7 +1010,6 @@ def create_optimizer(
                 filter_params,
                 lr=config.lr,
                 momentum=config.momentum,
-                alpha=config.alpha,
                 nesterov=True,
                 weight_decay=weight_decay
             )

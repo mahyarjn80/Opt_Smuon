@@ -253,7 +253,7 @@ def _compute_matrix_fractional_power_remez_numpy(M, alpha, degree=15):
     M_norm = M / scale
 
     # 2. Get Coefficients
-    coeffs = get_cached_coefficients(alpha, degree, fixed_range=(1e-3, 1.0))
+    coeffs = get_cached_coefficients(alpha, degree, fixed_range=(1e-10, 1.0))
 
     # 3. Evaluate Polynomial on G = M_norm^T M_norm
     if m >= n:
