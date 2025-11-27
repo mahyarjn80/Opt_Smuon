@@ -1,6 +1,7 @@
 import numpy as np
 import scipy.linalg
 import matplotlib.pyplot as plt
+import torch
 
 class RemezSolver:
     """
@@ -174,22 +175,84 @@ def get_cached_coefficients(alpha, degree=15, fixed_range=(1e-6, 1.0)):
 def compute_matrix_fractional_power_remez(M, alpha, degree=15):
     """
     Computes U * Sigma^alpha * V^T efficiently.
+    Works with both NumPy arrays and PyTorch tensors.
 
     1. Normalizes M to ensure spectral norm <= 1.
     2. Fetches cached coefficients (Offline Stage).
     3. Applies polynomial (Online Stage).
     4. Rescales result.
+
+    Args:
+        M: Input matrix (NumPy array or PyTorch tensor)
+        alpha: Fractional power exponent
+        degree: Polynomial degree for Remez approximation
+
+    Returns:
+        M^alpha in the same format as input (NumPy or PyTorch)
+    """
+    # Detect if input is PyTorch tensor
+    is_torch = isinstance(M, torch.Tensor)
+
+    if is_torch:
+        return _compute_matrix_fractional_power_remez_torch(M, alpha, degree)
+    else:
+        return _compute_matrix_fractional_power_remez_numpy(M, alpha, degree)
+
+
+def _compute_matrix_fractional_power_remez_torch(M, alpha, degree=15):
+    """
+    PyTorch version of compute_matrix_fractional_power_remez.
+    Handles tensors on any device (CPU/CUDA).
+    """
+    device = M.device
+    dtype = M.dtype
+    m, n = M.shape
+
+    # 1. Normalize Matrix
+    scale = torch.linalg.matrix_norm(M, ord='fro') + 1e-8
+    M_norm = M / scale
+
+    # 2. Get Coefficients (computed in NumPy, then convert to PyTorch)
+    coeffs_np = get_cached_coefficients(alpha, degree, fixed_range=(1e-3, 1.0))
+    coeffs = torch.tensor(coeffs_np, device=device, dtype=dtype)
+
+    # 3. Evaluate Polynomial on G = M_norm^T @ M_norm
+    if m >= n:
+        G = M_norm.T @ M_norm
+
+        # Horner's method: P(G)
+        P_G = coeffs[-1] * torch.eye(n, device=device, dtype=dtype)
+        for i in range(degree - 1, -1, -1):
+            P_G = coeffs[i] * torch.eye(n, device=device, dtype=dtype) + G @ P_G
+
+        # X_norm = M_norm @ P(G)
+        X_norm = M_norm @ P_G
+    else:
+        G = M_norm @ M_norm.T
+        P_G = coeffs[-1] * torch.eye(m, device=device, dtype=dtype)
+        for i in range(degree - 1, -1, -1):
+            P_G = coeffs[i] * torch.eye(m, device=device, dtype=dtype) + G @ P_G
+
+        X_norm = P_G @ M_norm
+
+    # 4. Rescale Result
+    X = X_norm * (scale ** alpha)
+
+    return X
+
+
+def _compute_matrix_fractional_power_remez_numpy(M, alpha, degree=15):
+    """
+    NumPy version of compute_matrix_fractional_power_remez.
+    Original implementation for NumPy arrays.
     """
     m, n = M.shape
 
-    # 1. Normalize Matrix (Crucial for using fixed coefficients)
-    # Using Frobenius norm is a cheap, safe upper bound for Spectral norm
-    scale = np.linalg.norm(M, 'fro') + 1e-8 # Add epsilon to avoid divide by zero
+    # 1. Normalize Matrix
+    scale = np.linalg.norm(M, 'fro') + 1e-8
     M_norm = M / scale
 
-    # 2. Get Coefficients (Offline / Cached)
-    # We assume the normalized matrix has singular values in range roughly [1e-3, 1.0]
-    # The paper often uses [1e-3, 1] or similar for stability.
+    # 2. Get Coefficients
     coeffs = get_cached_coefficients(alpha, degree, fixed_range=(1e-3, 1.0))
 
     # 3. Evaluate Polynomial on G = M_norm^T M_norm
@@ -212,14 +275,6 @@ def compute_matrix_fractional_power_remez(M, alpha, degree=15):
         X_norm = P_G @ M_norm
 
     # 4. Rescale Result
-    # We computed (M/s) * P((M/s)^T (M/s))
-    # = (1/s) M * P(1/s^2 S^2)
-    # Our P(y) approximates y^((alpha-1)/2).
-    # So P(1/s^2 S^2) approx (1/s^2 S^2)^((alpha-1)/2) = (1/s)^(alpha-1) * S^(alpha-1)
-    # Total result approx (1/s) * (1/s)^(alpha-1) * M * S^(alpha-1)
-    # = (1/s)^alpha * U S S^(alpha-1) V.T = s^(-alpha) * U S^alpha V.T
-    # Therefore, we must multiply by s^alpha to recover the original scale.
-
     X = X_norm * (scale ** alpha)
 
     return X
