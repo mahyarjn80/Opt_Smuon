@@ -1,9 +1,10 @@
 """
-Advanced optimizers (Shampoo, Muon, Adam) implemented as PyTorch optimizers.
+Advanced optimizers (Shampoo, Muon, MuonRemez, Adam) implemented as PyTorch optimizers.
 
 This module provides:
 - Shampoo: Full-matrix preconditioning optimizer
 - Muon: Gradient orthogonalization optimizer
+- MuonRemez: Muon variant using Remez algorithm for matrix fractional powers
 - Adam: Adaptive moment estimation optimizer (AdamW variant)
 - Configuration classes and utilities for creating optimizers
 """
@@ -16,6 +17,8 @@ from typing import Any, Dict, Tuple, Iterable, Optional, Union, List
 import numpy as np
 import torch
 import torch.optim
+
+from src.remez import compute_matrix_fractional_power_remez
 
 
 Array = Any
@@ -491,6 +494,151 @@ class Muon(torch.optim.Optimizer):
 
 
 #############################################
+#           MuonRemez Optimizer             #
+#############################################
+
+class MuonRemez(torch.optim.Optimizer):
+    r"""Implements Muon Optimizer with Remez Algorithm for Matrix Fractional Powers.
+
+    Similar to Muon but uses Remez polynomial approximation to compute U·Σ^α·V^T
+    instead of Newton-Schulz orthogonalization (which computes Σ^0).
+
+    Update rule:
+        v_t = β v_{t-1} + (1-β) g_t              (momentum)
+        u_t = matrix_power_remez(v_t, α)         (fractional power via Remez)
+        W ← (1 - η*λ) W - η u_t                  (update with weight decay)
+
+    Arguments:
+        params (iterable): iterable of parameters to optimize or dicts defining
+            parameter groups
+        lr (float): learning rate (default: 1e-3)
+        momentum (float): momentum factor (default: 0.0)
+        alpha (float): fractional power exponent for Remez algorithm (default: 0.5)
+        nesterov (bool): whether to use Nesterov momentum (default: False)
+        weight_decay (float): weight decay (L2 penalty) (default: 0.0)
+        remez_degree (int): polynomial degree for Remez approximation (default: 15)
+
+    Example:
+        >>> optimizer = MuonRemez(model.parameters(), lr=0.001, momentum=0.9, alpha=0.5)
+        >>> optimizer.zero_grad()
+        >>> loss_fn(model(input), target).backward()
+        >>> optimizer.step()
+
+    Note:
+        This is a MATRIX optimizer - it works best with 2D+ parameters.
+        The Remez algorithm is applied to parameters reshaped as matrices.
+        alpha=0.0 approximates standard Muon (polar decomposition).
+    """
+
+    def __init__(
+        self,
+        params: Iterable[torch.Tensor],
+        lr: float = 1e-3,
+        momentum: float = 0.0,
+        alpha: float = 0.5,
+        nesterov: bool = False,
+        weight_decay: float = 0.0,
+        remez_degree: int = 15,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if momentum < 0.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+        if nesterov and momentum <= 0:
+            raise ValueError("Nesterov momentum requires a momentum value > 0")
+
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            alpha=alpha,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+            remez_degree=remez_degree,
+        )
+        super(MuonRemez, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            alpha = group['alpha']
+            nesterov = group['nesterov']
+            weight_decay = group['weight_decay']
+            remez_degree = group['remez_degree']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.data
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['momentum_buffer'] = torch.zeros_like(grad)
+
+                buf = state['momentum_buffer']
+
+                # Update momentum buffer: v_t = β v_{t-1} + (1-β) g_t
+                buf.lerp_(grad, 1 - momentum)
+
+                # Get update (with Nesterov if enabled)
+                if nesterov:
+                    update = grad.lerp(buf, momentum)
+                    # Bias correction for Nesterov
+                    bias_correction = 1 / (1 - momentum ** (state['step'] + 2))
+                else:
+                    update = buf.clone()
+                    # Bias correction
+                    bias_correction = 1 / (1 - momentum ** (state['step'] + 1))
+
+                #update = update * bias_correction
+
+                # Apply Remez: reshape to 2D, compute M^alpha, reshape back
+                if len(grad.shape) >= 2:
+                    # Reshape to matrix (first dim x product of rest)
+                    update_2d = update.view(len(update), -1)
+
+                    # Apply Remez algorithm to compute U·Σ^α·V^T
+                    update_remez_2d = compute_matrix_fractional_power_remez(
+                        update_2d, alpha, degree=remez_degree
+                    )
+
+                    # Reshape back
+                    update_remez = update_remez_2d.view(update.shape)
+
+                    # Scale by aspect ratio (from original Muon paper)
+                    aspect_ratio = max(1, grad.size(-2) / grad.size(-1))
+                    update_remez *= aspect_ratio ** 0.5
+                else:
+                    # For 1D parameters, just use the update as-is
+                    update_remez = update
+
+                state['step'] += 1
+
+                # Apply weight decay (decoupled)
+                p.data.mul_(1 - lr * weight_decay)
+
+                # Apply update
+                p.data.add_(update_remez, alpha=-lr)
+
+        return loss
+
+
+#############################################
 #             Adam Optimizer                #
 #############################################
 
@@ -618,19 +766,36 @@ class Adam(torch.optim.Optimizer):
 @dataclass
 class MuonConfig:
     """Configuration for Muon optimizer.
-    
+
     Attributes:
         lr: Learning rate
         momentum: Momentum factor for gradient smoothing
     """
     lr: float = 0.0005
     momentum: float = 0.9
-    
+
     def __str__(self):
         return f"Muon_lr{self.lr}_mom{self.momentum}"
 
 
-@dataclass  
+@dataclass
+class MuonRemezConfig:
+    """Configuration for MuonRemez optimizer.
+
+    Attributes:
+        lr: Learning rate
+        momentum: Momentum factor for gradient smoothing
+        alpha: Fractional power exponent for Remez algorithm
+    """
+    lr: float = 0.0005
+    momentum: float = 0.9
+    alpha: float = 0.5
+
+    def __str__(self):
+        return f"MuonRemez_lr{self.lr}_mom{self.momentum}_alpha{self.alpha}"
+
+
+@dataclass
 class ShampooConfig:
     """Configuration for Shampoo optimizer.
     
@@ -666,31 +831,34 @@ class AdamConfig:
 
 
 # Type alias for optimizer configurations
-OptimizerConfig = Union[MuonConfig, ShampooConfig, AdamConfig]
+OptimizerConfig = Union[MuonConfig, MuonRemezConfig, ShampooConfig, AdamConfig]
 
 
 def parse_optimizer_config(config_str: str) -> OptimizerConfig:
     """
     Parse optimizer config from CLI string format.
-    
+
     Format: "OptimizerType:param1=value1,param2=value2,..."
-    
+
     Examples:
         >>> parse_optimizer_config("Muon:lr=0.0005,momentum=0.9")
         MuonConfig(lr=0.0005, momentum=0.9)
-        
+
+        >>> parse_optimizer_config("MuonRemez:lr=0.0005,momentum=0.9,alpha=0.5")
+        MuonRemezConfig(lr=0.0005, momentum=0.9, alpha=0.5)
+
         >>> parse_optimizer_config("Shampoo:lr=0.0005,momentum=0.9,order_multiplier=2")
         ShampooConfig(lr=0.0005, momentum=0.9, order_multiplier=2)
-        
+
         >>> parse_optimizer_config("Adam:lr=0.01,beta1=0.9,beta2=0.95")
         AdamConfig(lr=0.01, beta1=0.9, beta2=0.95)
-    
+
     Args:
         config_str: String specification of optimizer config
-        
+
     Returns:
-        OptimizerConfig instance (MuonConfig, ShampooConfig, or AdamConfig)
-        
+        OptimizerConfig instance (MuonConfig, MuonRemezConfig, ShampooConfig, or AdamConfig)
+
     Raises:
         ValueError: If config string format is invalid or optimizer type is unknown
     """
@@ -727,6 +895,8 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
     # Create appropriate config
     if opt_type == 'muon':
         return MuonConfig(**params)
+    elif opt_type == 'muonremez':
+        return MuonRemezConfig(**params)
     elif opt_type == 'shampoo':
         return ShampooConfig(**params)
     elif opt_type == 'adam':
@@ -734,7 +904,7 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
     else:
         raise ValueError(
             f"Unknown optimizer type: {opt_type}. "
-            f"Valid types: 'muon', 'shampoo', 'adam'"
+            f"Valid types: 'muon', 'muonremez', 'shampoo', 'adam'"
         )
 
 
@@ -830,13 +1000,23 @@ def create_optimizer(
         )
         optimizers.append(adam_opt)
     
-    # Create main optimizer for filter params (Shampoo or Muon)
+    # Create main optimizer for filter params (Shampoo, Muon, or MuonRemez)
     if len(filter_params) > 0:
         if isinstance(config, MuonConfig):
             main_opt = Muon(
                 filter_params,
                 lr=config.lr,
                 momentum=config.momentum,
+                nesterov=True,
+                weight_decay=weight_decay
+            )
+            optimizers.append(main_opt)
+        elif isinstance(config, MuonRemezConfig):
+            main_opt = MuonRemez(
+                filter_params,
+                lr=config.lr,
+                momentum=config.momentum,
+                alpha=config.alpha,
                 nesterov=True,
                 weight_decay=weight_decay
             )
@@ -853,7 +1033,7 @@ def create_optimizer(
         else:
             raise ValueError(
                 f"Unknown optimizer config: {type(config)}. "
-                f"Expected MuonConfig or ShampooConfig."
+                f"Expected MuonConfig, MuonRemezConfig, or ShampooConfig."
             )
     
     return optimizers
