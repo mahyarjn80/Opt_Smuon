@@ -387,16 +387,16 @@ def print_training_details(
 def compute_singular_values(model: nn.Module, param_names: List[str] = None) -> Dict[str, Any]:
     """
     Compute singular values for all 2D+ parameters in the model.
-    
+
     This is a utility function for tracking weight matrix properties during training.
-    
+
     Args:
         model: PyTorch model
         param_names: Optional list of parameter names to track. If None, track all 2D+ params.
-    
+
     Returns:
         Dictionary mapping parameter names to their singular values (as numpy arrays)
-        
+
     Example:
         >>> model = MyModel()
         >>> sv = compute_singular_values(model)
@@ -404,21 +404,21 @@ def compute_singular_values(model: nn.Module, param_names: List[str] = None) -> 
         ...     print(f"{name}: condition number = {values[0] / values[-1]:.2f}")
     """
     singular_values = {}
-    
+
     with torch.no_grad():
         for name, param in model.named_parameters():
             if param.ndim < 2:
                 continue
             if param_names is not None and name not in param_names:
                 continue
-                
+
             # Reshape to 2D if needed
             if param.ndim == 2:
                 matrix = param.data
             else:
                 # For higher dimensional tensors, reshape to 2D
                 matrix = param.data.reshape(param.size(0), -1)
-            
+
             # Compute SVD (only singular values)
             try:
                 # Move to CPU for SVD computation
@@ -428,6 +428,107 @@ def compute_singular_values(model: nn.Module, param_names: List[str] = None) -> 
             except Exception as e:
                 print(f"Warning: Could not compute SVD for {name}: {e}")
                 continue
-    
+
     return singular_values
+
+
+def get_important_conv_layer(model: nn.Module) -> str:
+    """
+    Automatically identify an important conv layer for gradient tracking.
+
+    For CifarNet: selects the first conv in the first ConvGroup (layers.0.conv1)
+    For other architectures: selects the first Conv2d layer found
+
+    Args:
+        model: PyTorch model
+
+    Returns:
+        Parameter name of the important conv layer, or None if no conv layer found
+    """
+    # For CifarNet: use first conv in first block
+    for name in ['layers.0.conv1.weight', 'layers.1.conv1.weight']:
+        if any(n == name for n, _ in model.named_parameters()):
+            return name
+
+    # Fallback: find first Conv2d layer
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d) and any(n.startswith(name + '.weight') for n, _ in model.named_parameters()):
+            return name + '.weight'
+
+    return None
+
+
+def compute_gradient_statistics(model: nn.Module, param_name: str = None) -> Dict[str, Any]:
+    """
+    Compute comprehensive gradient statistics for a specific parameter.
+
+    Tracks gradient spectrum (singular values), norms, and trace - useful for understanding
+    optimization dynamics and gradient flow.
+
+    Args:
+        model: PyTorch model
+        param_name: Name of parameter to track. If None, auto-detects important conv layer.
+
+    Returns:
+        Dictionary containing:
+            - 'spectrum': Singular values of gradient (numpy array)
+            - 'frobenius_norm': Frobenius norm ||∇||_F
+            - 'spectral_norm': Spectral norm (largest singular value) ||∇||_2
+            - 'trace': Trace of gradient Gram matrix Tr(∇^T∇)
+            - 'param_name': Name of the tracked parameter
+
+    Example:
+        >>> # During training, after loss.backward()
+        >>> grad_stats = compute_gradient_statistics(model, 'layers.0.conv1.weight')
+        >>> print(f"Gradient spectral norm: {grad_stats['spectral_norm']:.2e}")
+        >>> print(f"Condition number: {grad_stats['spectrum'][0] / grad_stats['spectrum'][-1]:.2f}")
+    """
+    # Auto-detect parameter if not specified
+    if param_name is None:
+        param_name = get_important_conv_layer(model)
+        if param_name is None:
+            return {}
+
+    # Find the parameter
+    param = None
+    for name, p in model.named_parameters():
+        if name == param_name:
+            param = p
+            break
+
+    if param is None or param.grad is None:
+        return {}
+
+    grad = param.grad.data
+
+    # Reshape to 2D if needed (conv layers are typically 4D: out_ch, in_ch, h, w)
+    if grad.ndim == 2:
+        grad_2d = grad
+    else:
+        grad_2d = grad.reshape(grad.size(0), -1)
+
+    stats = {'param_name': param_name}
+
+    try:
+        # Move to CPU and convert to float32 for numerical stability
+        grad_cpu = grad_2d.cpu().float()
+
+        # Compute SVD to get spectrum
+        _, s, _ = torch.svd(grad_cpu)
+        stats['spectrum'] = s.numpy()
+
+        # Spectral norm (largest singular value)
+        stats['spectral_norm'] = s[0].item()
+
+        # Frobenius norm: ||G||_F = sqrt(sum of squared entries)
+        stats['frobenius_norm'] = torch.linalg.norm(grad_cpu, ord='fro').item()
+
+        # Trace of Gram matrix: Tr(G^T G) = sum of squared singular values
+        stats['trace'] = (s ** 2).sum().item()
+
+    except Exception as e:
+        print(f"Warning: Could not compute gradient statistics for {param_name}: {e}")
+        return {}
+
+    return stats
 

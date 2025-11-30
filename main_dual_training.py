@@ -20,6 +20,7 @@ from src.utils import convert_dataclasses
 from src.dual_training_loggers import (
     create_default_loggers, LossAndAccuracyLogger,
     print_columns, print_training_details, compute_singular_values,
+    compute_gradient_statistics, get_important_conv_layer,
     DEFAULT_LOGGING_COLUMNS
 )
 from src.data import CifarLoader, CIFAR_MEAN, CIFAR_STD
@@ -167,20 +168,26 @@ def main(
         print(f"  - {model_name}: {len(filter_params)} filter, {len(head_params)} head, {len(bias_params)} bias params")
     
 
-    model_logs = {name: [] for name in models.keys()}  
-    singular_values_logs = {name: [] for name in models.keys()}  
+    model_logs = {name: [] for name in models.keys()}
+    singular_values_logs = {name: [] for name in models.keys()}
+    gradient_statistics_logs = {name: [] for name in models.keys()}  # New: gradient tracking
     logger_data = {name: [] for name in models.keys()}  
     
 
     print("\n[4/5] Setting up Loggers...")
     logger_suite = create_default_loggers(
         label_smoothing=label_smoothing,
-        track_singular_values=True  
+        track_singular_values=True
     )
     process_loggers = logger_suite['process']
     group_loggers = logger_suite['group']
     print(f"  - Process loggers: {len(process_loggers)}")
     print(f"  - Group loggers: {len(group_loggers)}")
+
+    # Identify important conv layer for gradient tracking (if CifarNet)
+    gradient_track_param = get_important_conv_layer(base_model)
+    if gradient_track_param:
+        print(f"  - Tracking gradients for: {gradient_track_param}")
     
 
     print("\n[5/5] Training...")
@@ -237,9 +244,14 @@ def main(
                             group["lr"] = group["initial_lr"] * (1 - step / total_train_steps)
                 
 
+                # Compute gradient statistics BEFORE optimizer step (captures raw gradients)
+                if step % svd_freq == 0 and gradient_track_param:
+                    grad_stats = compute_gradient_statistics(model, gradient_track_param)
+                    gradient_statistics_logs[model_name].append((step, grad_stats))
+
                 for opt in optimizers_dict[model_name]:
                     opt.step()
-                
+
 
                 model.zero_grad(set_to_none=True)
                 
@@ -255,7 +267,10 @@ def main(
                 for model_name, model in models.items():
                     sv = compute_singular_values(model, filter_param_names_dict[model_name])
                     singular_values_logs[model_name].append((step, sv))
-                print(f"  [Step {step}] Recorded SVD for {len(models)} models")
+                msg = f"Recorded SVD for {len(models)} models"
+                if gradient_track_param:
+                    msg += f" + gradient stats"
+                print(f"  [Step {step}] {msg}")
             
             step += 1
             if step >= total_train_steps:
@@ -386,7 +401,14 @@ def main(
             safe_name = model_name.replace(".", "_").replace("/", "_")
             with open(os.path.join(log_dir, f"singular_values_{safe_name}.pkl"), 'wb') as f:
                 pickle.dump(singular_values_logs[model_name], f)
-        
+
+        # Save gradient statistics
+        if gradient_track_param:
+            for model_name in models.keys():
+                safe_name = model_name.replace(".", "_").replace("/", "_")
+                with open(os.path.join(log_dir, f"gradient_stats_{safe_name}.pkl"), 'wb') as f:
+                    pickle.dump(gradient_statistics_logs[model_name], f)
+
 
         for model_name, model in models.items():
             safe_name = model_name.replace(".", "_").replace("/", "_")
@@ -417,6 +439,8 @@ def main(
         print(f"  - Metrics: metrics_*.npy and metrics_*.json for each model")
         print(f"  - Detailed logger data: logger_data_*.pkl for each model (includes singular values, grad norms, etc.)")
         print(f"  - Singular values: singular_values_*.pkl for each model (legacy format)")
+        if gradient_track_param:
+            print(f"  - Gradient statistics: gradient_stats_*.pkl for each model (spectrum, norms, trace)")
         print(f"  - Models: model_*.pt for each model")
     
     print("\n" + "=" * 80)
