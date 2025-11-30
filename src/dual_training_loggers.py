@@ -432,19 +432,26 @@ def compute_singular_values(model: nn.Module, param_names: List[str] = None) -> 
     return singular_values
 
 
-def get_important_conv_layer(model: nn.Module) -> str:
+def get_important_conv_layer(model: nn.Module, method : str = None) -> str:
     """
-    Automatically identify an important conv layer for gradient tracking.
+    Automatically identify an important layer for gradient tracking.
 
+    For VIT: selects transformer.layers.3.0.to_qkv.weight
     For CifarNet: selects the first conv in the first ConvGroup (layers.0.conv1)
     For other architectures: selects the first Conv2d layer found
 
     Args:
         model: PyTorch model
+        method: Optional method hint (not currently used)
 
     Returns:
-        Parameter name of the important conv layer, or None if no conv layer found
+        Parameter name of the important layer, or None if no appropriate layer found
     """
+    # For VIT: use transformer.layers.3.0.to_qkv.weight
+    vit_param_name = 'transformer.layers.3.0.to_qkv.weight'
+    if any(n == vit_param_name for n, _ in model.named_parameters()):
+        return vit_param_name
+
     # For CifarNet: use first conv in first block
     for name in ['layers.0.conv1.weight', 'layers.1.conv1.weight']:
         if any(n == name for n, _ in model.named_parameters()):
