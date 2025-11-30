@@ -1009,7 +1009,7 @@ class HybridMuonRemezConfig:
         if self.blend_decay_fraction == 0.0 or self.blend_start == self.blend_end:
             return f"HybridMR_lr{self.lr}_mom{self.momentum}_blend{self.blend_start}"
         else:
-            return f"HybridMR_lr{self.lr}_{self.blend_schedule}_b{self.blend_start}to{self.blend_end}"
+            return f"HybridMR_lr{self.lr}_mom{self.momentum}_{self.blend_schedule}_b{self.blend_start}to{self.blend_end}"
 
     def create_blend_schedule(self, total_train_steps: int):
         """Create blend schedule function based on config and total training steps.
