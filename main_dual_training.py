@@ -149,7 +149,8 @@ def main(
         # Use the parameter grouping strategy
         filter_params, head_params, bias_params, filter_names = get_param_groups(model, param_group_strategy)
         opts = create_optimizer(opt_config, filter_params, head_params, bias_params,
-                               weight_decay, weight_decay_misc, lr_head, lr_bias)
+                               weight_decay, weight_decay_misc, lr_head, lr_bias,
+                               total_train_steps=total_train_steps)
         
 
         for opt in opts:
@@ -336,8 +337,10 @@ def main(
         print("Saving Results...")
         
 
-        optimizer_names = "_vs_".join([str(cfg).replace("_", "-")[:20] for cfg in optimizer_configs])
-        log_dir = os.path.join('logs', f'multi_training_{optimizer_names}_{str(uuid.uuid4())[:8]}')
+        # Create short, indicative log directory name
+        first_opt = str(optimizer_configs[0]).split('_')[0] if optimizer_configs else 'unknown'
+        num_opts = len(optimizer_configs)
+        log_dir = os.path.join('logs', f'{first_opt}_{num_opts}opts_{str(uuid.uuid4())[:8]}')
         os.makedirs(log_dir, exist_ok=True)
         
 

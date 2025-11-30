@@ -635,6 +635,163 @@ class MuonRemez(torch.optim.Optimizer):
 
 
 #############################################
+#      Hybrid Muon-MuonRemez Optimizer      #
+#############################################
+
+class HybridMuonRemez(torch.optim.Optimizer):
+    r"""Hybrid optimizer blending Muon (α=0, orthogonalization) and MuonRemez (α=0.5, sqrt).
+
+    This optimizer blends between two matrix function preconditioners:
+    - Muon: Uses Newton-Schulz for orthogonalization (zeroth power, Σ^0)
+    - MuonRemez: Uses coupled Newton-Schulz for square root (Σ^0.5)
+
+    Update rule:
+        v_t = β v_{t-1} + (1-β) g_t                      (momentum)
+        u_muon = NS_zeroth_power(v_t)                    (Muon: orthogonalize)
+        u_remez = NS_sqrt(v_t)                           (MuonRemez: sqrt)
+        u_t = λ(t) * u_muon + (1-λ(t)) * u_remez         (blend)
+        W ← (1 - η*wd) W - η u_t                         (update)
+
+    Arguments:
+        params (iterable): parameters to optimize
+        lr (float): learning rate (default: 1e-3)
+        momentum (float): momentum factor (default: 0.9)
+        nesterov (bool): whether to use Nesterov momentum (default: True)
+        weight_decay (float): weight decay (L2 penalty) (default: 0.0)
+        ns_steps (int): Newton-Schulz iterations (default: 5)
+        blend_schedule_fn (callable): function(step) -> lambda in [0,1] where
+            lambda=1.0 means 100% Muon (orthogonalization)
+            lambda=0.0 means 100% MuonRemez (square root)
+            Default: constant 0.5 (50% blend)
+
+    Example:
+        >>> # Start with 100% Muon, decay to 100% MuonRemez over 500 steps
+        >>> optimizer = HybridMuonRemez(
+        ...     model.parameters(),
+        ...     lr=0.0005,
+        ...     momentum=0.9,
+        ...     blend_schedule_fn=lambda s: max(0.0, 1.0 - s/500)
+        ... )
+
+    Note:
+        - Memory efficient: single momentum buffer, no duplication
+        - Both methods share same momentum and apply same scaling
+        - Only difference is the matrix preconditioning function
+    """
+
+    def __init__(
+        self,
+        params: Iterable[torch.Tensor],
+        lr: float = 1e-3,
+        momentum: float = 0.9,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+        ns_steps: int = 5,
+        blend_schedule_fn=None,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if momentum < 0.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+        if nesterov and momentum <= 0:
+            raise ValueError("Nesterov momentum requires a momentum value > 0")
+
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+            ns_steps=ns_steps,
+        )
+        self.blend_schedule_fn = blend_schedule_fn or (lambda step: 0.5)
+        super(HybridMuonRemez, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step with blended Muon-MuonRemez update."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            nesterov = group['nesterov']
+            weight_decay = group['weight_decay']
+            ns_steps = group['ns_steps']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.data
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['momentum_buffer'] = torch.zeros_like(grad)
+
+                buf = state['momentum_buffer']
+
+                # Update momentum buffer: v_t = β v_{t-1} + (1-β) g_t
+                buf.lerp_(grad, 1 - momentum)
+
+                # Get update (with Nesterov if enabled)
+                if nesterov:
+                    update = grad.lerp(buf, momentum)
+                else:
+                    update = buf.clone()
+
+                # Get blend coefficient for this step
+                blend_coeff = self.blend_schedule_fn(state['step'])
+                blend_coeff = max(0.0, min(1.0, blend_coeff))  # Clamp to [0, 1]
+
+                # Apply matrix preconditioning (blend Muon and MuonRemez)
+                if len(grad.shape) >= 2:
+                    # Reshape to matrix (first dim x product of rest)
+                    update_2d = update.view(len(update), -1)
+
+                    # Compute both updates
+                    if blend_coeff == 1.0:
+                        # 100% Muon (orthogonalization only)
+                        update_precond_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
+                    elif blend_coeff == 0.0:
+                        # 100% MuonRemez (sqrt only)
+                        update_precond_2d = compute_u_sigma_half_vt(
+                            update_2d, steps=ns_steps, variant='muon_aggressive'
+                        )
+                    else:
+                        # Blend both
+                        muon_update_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
+                        remez_update_2d = compute_u_sigma_half_vt(
+                            update_2d, steps=ns_steps, variant='muon_aggressive'
+                        )
+                        update_precond_2d =  muon_update_2d + blend_coeff * remez_update_2d
+
+                    # Reshape back
+                    update_precond = update_precond_2d.view(update.shape)
+
+                    # Scale by aspect ratio (from original Muon paper)
+                    aspect_ratio = max(1, grad.size(-2) / grad.size(-1))
+                    update_precond *= aspect_ratio ** 0.5
+                else:
+                    # For 1D parameters, just use the update as-is
+                    update_precond = update
+
+                state['step'] += 1
+
+                # Apply weight decay (decoupled)
+                p.data.mul_(1 - lr * weight_decay)
+
+                # Apply update
+                p.data.add_(update_precond, alpha=-lr)
+
+        return loss
+
+
+#############################################
 #             Adam Optimizer                #
 #############################################
 
@@ -810,7 +967,7 @@ class ShampooConfig:
 @dataclass
 class AdamConfig:
     """Configuration for Adam optimizer.
-    
+
     Attributes:
         lr: Learning rate
         beta1: Exponential decay rate for first moment estimates
@@ -819,13 +976,101 @@ class AdamConfig:
     lr: float = 0.01
     beta1: float = 0.9
     beta2: float = 0.95
-    
+
     def __str__(self):
         return f"Adam_lr{self.lr}_b1{self.beta1}_b2{self.beta2}"
 
 
+@dataclass
+class HybridMuonRemezConfig:
+    """Configuration for HybridMuonRemez optimizer.
+
+    Attributes:
+        lr: Learning rate
+        momentum: Momentum factor for gradient smoothing
+        blend_start: Initial blend coefficient (1.0 = 100% Muon, 0.0 = 100% MuonRemez)
+        blend_end: Final blend coefficient after decay
+        blend_decay_fraction: Fraction of total training steps over which to decay
+            (e.g., 0.5 means decay over first 50% of training)
+        blend_schedule: Schedule type: 'linear', 'cosine', 'polynomial', 'exponential', 'constant'
+        blend_power: Power for polynomial schedule (only used if blend_schedule='polynomial')
+        blend_exp_rate: Exponential decay rate (only used if blend_schedule='exponential')
+    """
+    lr: float = 0.0005
+    momentum: float = 0.9
+    blend_start: float = 1.0
+    blend_end: float = 0.0
+    blend_decay_fraction: float = 0.5
+    blend_schedule: str = 'linear'
+    blend_power: float = 2.0
+    blend_exp_rate: float = 5.0
+
+    def __str__(self):
+        if self.blend_decay_fraction == 0.0 or self.blend_start == self.blend_end:
+            return f"HybridMR_lr{self.lr}_mom{self.momentum}_blend{self.blend_start}"
+        else:
+            return f"HybridMR_lr{self.lr}_{self.blend_schedule}_b{self.blend_start}to{self.blend_end}"
+
+    def create_blend_schedule(self, total_train_steps: int):
+        """Create blend schedule function based on config and total training steps.
+
+        Args:
+            total_train_steps: Total number of training steps
+
+        Returns:
+            Callable that takes current step and returns blend coefficient in [0, 1]
+        """
+        import math
+
+        decay_steps = int(self.blend_decay_fraction * total_train_steps)
+
+        if decay_steps == 0 or self.blend_start == self.blend_end:
+            # Constant blend
+            return lambda step: self.blend_start
+
+        if self.blend_schedule == 'linear':
+            def linear_blend(step):
+                if step >= decay_steps:
+                    return self.blend_end
+                progress = step / decay_steps
+                return self.blend_start + progress * (self.blend_end - self.blend_start)
+            return linear_blend
+
+        elif self.blend_schedule == 'cosine':
+            def cosine_blend(step):
+                if step >= decay_steps:
+                    return self.blend_end
+                progress = step / decay_steps
+                # Cosine annealing: smooth transition from start to end
+                cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+                return self.blend_end + cosine_factor * (self.blend_start - self.blend_end)
+            return cosine_blend
+
+        elif self.blend_schedule == 'polynomial':
+            def polynomial_blend(step):
+                if step >= decay_steps:
+                    return self.blend_end
+                progress = step / decay_steps
+                poly_factor = (1 - progress) ** self.blend_power
+                return self.blend_end + poly_factor * (self.blend_start - self.blend_end)
+            return polynomial_blend
+
+        elif self.blend_schedule == 'exponential':
+            def exponential_blend(step):
+                if step >= decay_steps:
+                    return self.blend_end
+                progress = step / decay_steps
+                # Exponential decay: exp(-rate * progress)
+                exp_factor = math.exp(-self.blend_exp_rate * progress)
+                return self.blend_end + exp_factor * (self.blend_start - self.blend_end)
+            return exponential_blend
+
+        else:  # constant or unknown
+            return lambda step: self.blend_start
+
+
 # Type alias for optimizer configurations
-OptimizerConfig = Union[MuonConfig, MuonRemezConfig, ShampooConfig, AdamConfig]
+OptimizerConfig = Union[MuonConfig, MuonRemezConfig, ShampooConfig, AdamConfig, HybridMuonRemezConfig]
 
 
 def parse_optimizer_config(config_str: str) -> OptimizerConfig:
@@ -847,21 +1092,24 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
         >>> parse_optimizer_config("Adam:lr=0.01,beta1=0.9,beta2=0.95")
         AdamConfig(lr=0.01, beta1=0.9, beta2=0.95)
 
+        >>> parse_optimizer_config("HybridMuonRemez:lr=0.0005,blend_start=1.0,blend_end=0.0,blend_schedule=linear")
+        HybridMuonRemezConfig(lr=0.0005, blend_start=1.0, blend_end=0.0, blend_schedule='linear')
+
     Args:
         config_str: String specification of optimizer config
 
     Returns:
-        OptimizerConfig instance (MuonConfig, MuonRemezConfig, ShampooConfig, or AdamConfig)
+        OptimizerConfig instance
 
     Raises:
         ValueError: If config string format is invalid or optimizer type is unknown
     """
     if ':' not in config_str:
         raise ValueError(f"Config string must contain ':' separator. Got: {config_str}")
-    
+
     parts = config_str.split(':', 1)
     opt_type = parts[0].strip().lower()
-    
+
     # Parse parameters
     params = {}
     if len(parts) > 1 and parts[1].strip():
@@ -869,23 +1117,26 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
             param = param.strip()
             if '=' not in param:
                 raise ValueError(f"Parameter must be in format 'key=value'. Got: {param}")
-            
+
             key, val = param.split('=', 1)
             key = key.strip()
             val = val.strip()
-            
+
             # Try to convert to appropriate type
             try:
                 # Check if it's an integer
                 if val.isdigit() or (val.startswith('-') and val[1:].isdigit()):
                     params[key] = int(val)
-                # Check if it's a float
-                else:
+                # Check if it's a float (has decimal point)
+                elif '.' in val:
                     params[key] = float(val)
+                else:
+                    # Keep as string (for blend_schedule, etc.)
+                    params[key] = val
             except ValueError:
                 # Keep as string if conversion fails
                 params[key] = val
-    
+
     # Create appropriate config
     if opt_type == 'muon':
         return MuonConfig(**params)
@@ -895,10 +1146,12 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
         return ShampooConfig(**params)
     elif opt_type == 'adam':
         return AdamConfig(**params)
+    elif opt_type == 'hybridmuonremez' or opt_type == 'hybrid':
+        return HybridMuonRemezConfig(**params)
     else:
         raise ValueError(
             f"Unknown optimizer type: {opt_type}. "
-            f"Valid types: 'muon', 'muonremez', 'shampoo', 'adam'"
+            f"Valid types: 'muon', 'muonremez', 'shampoo', 'adam', 'hybridmuonremez'"
         )
 
 
@@ -906,26 +1159,27 @@ def create_optimizer(
     config: OptimizerConfig,
     filter_params: List,
     head_params: List,
-    bias_params: List, 
+    bias_params: List,
     weight_decay: float,
     weight_decay_misc: float,
     lr_head: float,
-    lr_bias: float
+    lr_bias: float,
+    total_train_steps: int = None
 ) -> List[torch.optim.Optimizer]:
     """
     Create optimizer instances based on configuration.
-    
+
     This function creates separate optimizers for different parameter groups:
-    - Filter/weight parameters use the specified optimizer (Muon or Shampoo)
+    - Filter/weight parameters use the specified optimizer (Muon, MuonRemez, Shampoo, or HybridMuonRemez)
     - Biases and head/embedding parameters ALWAYS use Adam (with default settings)
-    
+
     For CifarNet, the Adam optimizer has 3 param groups:
         param_groups[0]: whitening bias (first element of bias_params)
         param_groups[1]: other biases (remaining elements of bias_params)
         param_groups[2]: head params
-    
+
     Args:
-        config: Optimizer configuration (MuonConfig or ShampooConfig)
+        config: Optimizer configuration
         filter_params: List of filter/weight parameters (2D+ parameters)
         head_params: List of head/embedding parameters
         bias_params: List of bias parameters (1D parameters, first is whitening bias for CifarNet)
@@ -933,26 +1187,27 @@ def create_optimizer(
         weight_decay_misc: Weight decay for biases and heads
         lr_head: Learning rate for head parameters
         lr_bias: Learning rate for bias parameters
-        
+        total_train_steps: Total training steps (required for HybridMuonRemezConfig)
+
     Returns:
         List of optimizer instances for this model
-        
+
     Example:
-        >>> config = ShampooConfig(lr=0.0005, momentum=0.9, order_multiplier=2)
+        >>> config = HybridMuonRemezConfig(lr=0.0005, blend_start=1.0, blend_end=0.0)
         >>> opts = create_optimizer(
         ...     config, filter_params, head_params, bias_params,
         ...     weight_decay=1.0, weight_decay_misc=1e-4,
-        ...     lr_head=0.01, lr_bias=0.01
+        ...     lr_head=0.01, lr_bias=0.01,
+        ...     total_train_steps=1000
         ... )
-        >>> # Returns: [Adam(bias_params + head_params), Shampoo(filter_params)]
         >>> for opt in opts:
         ...     opt.step()
     """
     optimizers = []
-    
+
     # Always create Adam optimizer for biases and heads (regardless of main optimizer)
     param_configs_adam = []
-    
+
     if len(bias_params) > 0:
         # For CifarNet: first bias param is whitening bias (needs separate param group for different LR schedule)
         # Split into 3 param groups: [whitening_bias], [other_biases], [head]
@@ -975,14 +1230,14 @@ def create_optimizer(
                 lr=lr_bias,
                 weight_decay=weight_decay_misc/lr_bias
             ))
-    
+
     if len(head_params) > 0:
         param_configs_adam.append(dict(
             params=head_params,
             lr=lr_head,
             weight_decay=weight_decay_misc/lr_head
         ))
-    
+
     if param_configs_adam:
         # Always use Adam for bias/head params with default betas
         adam_opt = Adam(
@@ -993,8 +1248,8 @@ def create_optimizer(
             weight_decay=0.0  # Not used - each param group has its own weight_decay
         )
         optimizers.append(adam_opt)
-    
-    # Create main optimizer for filter params (Shampoo, Muon, or MuonRemez)
+
+    # Create main optimizer for filter params (Shampoo, Muon, MuonRemez, or HybridMuonRemez)
     if len(filter_params) > 0:
         if isinstance(config, MuonConfig):
             main_opt = Muon(
@@ -1023,11 +1278,27 @@ def create_optimizer(
                 order_multiplier=config.order_multiplier
             )
             optimizers.append(main_opt)
+        elif isinstance(config, HybridMuonRemezConfig):
+            if total_train_steps is None:
+                raise ValueError("total_train_steps is required for HybridMuonRemezConfig")
+
+            # Create blend schedule function
+            blend_schedule_fn = config.create_blend_schedule(total_train_steps)
+
+            main_opt = HybridMuonRemez(
+                filter_params,
+                lr=config.lr,
+                momentum=config.momentum,
+                nesterov=True,
+                weight_decay=weight_decay,
+                blend_schedule_fn=blend_schedule_fn
+            )
+            optimizers.append(main_opt)
         else:
             raise ValueError(
                 f"Unknown optimizer config: {type(config)}. "
-                f"Expected MuonConfig, MuonRemezConfig, or ShampooConfig."
+                f"Expected MuonConfig, MuonRemezConfig, ShampooConfig, or HybridMuonRemezConfig."
             )
-    
+
     return optimizers
 
