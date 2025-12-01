@@ -20,7 +20,7 @@ from src.utils import convert_dataclasses
 from src.dual_training_loggers import (
     create_default_loggers, LossAndAccuracyLogger,
     print_columns, print_training_details, compute_singular_values,
-    compute_gradient_statistics, get_important_conv_layer,
+    compute_gradient_statistics, compute_gradient_spectra, get_important_conv_layer,
     DEFAULT_LOGGING_COLUMNS
 )
 from src.data import CifarLoader, CIFAR_MEAN, CIFAR_STD
@@ -170,7 +170,8 @@ def main(
 
     model_logs = {name: [] for name in models.keys()}
     singular_values_logs = {name: [] for name in models.keys()}
-    gradient_statistics_logs = {name: [] for name in models.keys()}  # New: gradient tracking
+    gradient_statistics_logs = {name: [] for name in models.keys()}  # Single layer gradient tracking
+    gradient_spectra_logs = {name: [] for name in models.keys()}  # All filter layers gradient spectra
     logger_data = {name: [] for name in models.keys()}  
     
 
@@ -245,32 +246,47 @@ def main(
                 
 
                 # Compute gradient statistics BEFORE optimizer step (captures raw gradients)
-                if step % svd_freq == 0 and gradient_track_param:
-                    grad_stats = compute_gradient_statistics(model, gradient_track_param)
-                    gradient_statistics_logs[model_name].append((step, grad_stats))
+                if step % svd_freq == 0:
+                    # Compute gradient spectra for all filter layers
+                    grad_spectra = compute_gradient_spectra(model, filter_param_names_dict[model_name])
+                    gradient_spectra_logs[model_name].append((step, grad_spectra))
+
+                    # Also compute for single important layer (if exists)
+                    if gradient_track_param:
+                        grad_stats = compute_gradient_statistics(model, gradient_track_param)
+                        gradient_statistics_logs[model_name].append((step, grad_stats))
 
                 for opt in optimizers_dict[model_name]:
                     opt.step()
 
 
                 model.zero_grad(set_to_none=True)
-                
+
 
                 with torch.no_grad():
                     epoch_metrics[model_name]['loss'] += loss.item()
                     epoch_metrics[model_name]['correct'] += (outputs.argmax(1) == labels).float().sum().item()
                     epoch_metrics[model_name]['samples'] += len(inputs)
-            
 
+
+            # Comment out layer SVD computation for now (too costly)
+            # if step % svd_freq == 0:
+            #     print(f"\n  [Step {step}] Computing singular values...")
+            #     for model_name, model in models.items():
+            #         sv = compute_singular_values(model, filter_param_names_dict[model_name])
+            #         singular_values_logs[model_name].append((step, sv))
+            #     msg = f"Recorded SVD for {len(models)} models"
+            #     if gradient_track_param:
+            #         msg += f" + gradient stats"
+            #     print(f"  [Step {step}] {msg}")
+
+            # Log gradient spectra computation
             if step % svd_freq == 0:
-                print(f"\n  [Step {step}] Computing singular values...")
-                for model_name, model in models.items():
-                    sv = compute_singular_values(model, filter_param_names_dict[model_name])
-                    singular_values_logs[model_name].append((step, sv))
-                msg = f"Recorded SVD for {len(models)} models"
+                num_layers = len(filter_param_names_dict[next(iter(models.keys()))])
+                msg = f"\n  [Step {step}] Recorded gradient spectra for {len(models)} models × {num_layers} layers"
                 if gradient_track_param:
-                    msg += f" + gradient stats"
-                print(f"  [Step {step}] {msg}")
+                    msg += f" + single-layer gradient stats"
+                print(msg)
             
             step += 1
             if step >= total_train_steps:
@@ -397,12 +413,19 @@ def main(
                 pickle.dump(logger_data[model_name], f)
         
 
+        # Save layer singular values (commented out for now - too costly during training)
+        # for model_name in models.keys():
+        #     safe_name = model_name.replace(".", "_").replace("/", "_")
+        #     with open(os.path.join(log_dir, f"singular_values_{safe_name}.pkl"), 'wb') as f:
+        #         pickle.dump(singular_values_logs[model_name], f)
+
+        # Save gradient spectra for all filter layers
         for model_name in models.keys():
             safe_name = model_name.replace(".", "_").replace("/", "_")
-            with open(os.path.join(log_dir, f"singular_values_{safe_name}.pkl"), 'wb') as f:
-                pickle.dump(singular_values_logs[model_name], f)
+            with open(os.path.join(log_dir, f"gradient_spectra_{safe_name}.pkl"), 'wb') as f:
+                pickle.dump(gradient_spectra_logs[model_name], f)
 
-        # Save gradient statistics
+        # Save single-layer gradient statistics (if tracked)
         if gradient_track_param:
             for model_name in models.keys():
                 safe_name = model_name.replace(".", "_").replace("/", "_")
@@ -437,10 +460,10 @@ def main(
         print(f"  - Results saved to: {os.path.abspath(log_dir)}")
         print(f"  - Config: config.pt, README.md")
         print(f"  - Metrics: metrics_*.npy and metrics_*.json for each model")
-        print(f"  - Detailed logger data: logger_data_*.pkl for each model (includes singular values, grad norms, etc.)")
-        print(f"  - Singular values: singular_values_*.pkl for each model (legacy format)")
+        print(f"  - Detailed logger data: logger_data_*.pkl for each model (includes grad norms, etc.)")
+        print(f"  - Gradient spectra: gradient_spectra_*.pkl for each model (all filter layers)")
         if gradient_track_param:
-            print(f"  - Gradient statistics: gradient_stats_*.pkl for each model (spectrum, norms, trace)")
+            print(f"  - Single-layer gradient statistics: gradient_stats_*.pkl for each model")
         print(f"  - Models: model_*.pt for each model")
     
     print("\n" + "=" * 80)

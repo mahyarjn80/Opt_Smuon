@@ -539,3 +539,73 @@ def compute_gradient_statistics(model: nn.Module, param_name: str = None) -> Dic
 
     return stats
 
+
+def compute_gradient_spectra(model: nn.Module, param_names: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Compute gradient spectra for multiple parameters.
+
+    This function computes the spectrum (singular values) of gradients for all specified
+    parameters, enabling analysis of gradient flow, conditioning, and optimization dynamics
+    across multiple layers.
+
+    Args:
+        model: PyTorch model
+        param_names: List of parameter names to track
+
+    Returns:
+        Dictionary mapping parameter names to their gradient statistics:
+            - 'spectrum': Singular values of gradient (numpy array)
+            - 'frobenius_norm': Frobenius norm ||∇||_F
+            - 'spectral_norm': Spectral norm (largest singular value) ||∇||_2
+            - 'trace': Trace of gradient Gram matrix Tr(∇^T∇)
+
+    Example:
+        >>> # During training, after loss.backward()
+        >>> param_names = ['layers.0.conv1.weight', 'layers.1.conv1.weight']
+        >>> grad_spectra = compute_gradient_spectra(model, param_names)
+        >>> for name, stats in grad_spectra.items():
+        ...     print(f"{name}: spectral norm = {stats['spectral_norm']:.2e}")
+    """
+    gradient_spectra = {}
+
+    with torch.no_grad():
+        for param_name in param_names:
+            # Find the parameter
+            param = None
+            for name, p in model.named_parameters():
+                if name == param_name:
+                    param = p
+                    break
+
+            if param is None or param.grad is None:
+                continue
+
+            grad = param.grad.data
+
+            # Reshape to 2D if needed
+            if grad.ndim == 2:
+                grad_2d = grad
+            else:
+                grad_2d = grad.reshape(grad.size(0), -1)
+
+            try:
+                # Move to CPU and convert to float32 for numerical stability
+                grad_cpu = grad_2d.cpu().float()
+
+                # Compute SVD to get spectrum
+                _, s, _ = torch.svd(grad_cpu)
+
+                # Store statistics
+                gradient_spectra[param_name] = {
+                    'spectrum': s.numpy(),
+                    'spectral_norm': s[0].item(),
+                    'frobenius_norm': torch.linalg.norm(grad_cpu, ord='fro').item(),
+                    'trace': (s ** 2).sum().item()
+                }
+
+            except Exception as e:
+                print(f"Warning: Could not compute gradient spectrum for {param_name}: {e}")
+                continue
+
+    return gradient_spectra
+
