@@ -756,9 +756,7 @@ class HybridMuonRemez(torch.optim.Optimizer):
 
                     if blend_coeff == 0.0:
                         # 100% MuonRemez (sqrt only)
-                        update_precond_2d = compute_u_sigma_half_vt(
-                            update_2d, steps=ns_steps, variant='muon_aggressive'
-                        )
+                        update_precond_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
                     else:
                         # Blend both
                         muon_update_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
@@ -766,6 +764,168 @@ class HybridMuonRemez(torch.optim.Optimizer):
                             update_2d, steps=ns_steps, variant='muon_aggressive'
                         )
                         update_precond_2d =  muon_update_2d + blend_coeff * remez_update_2d
+
+                    # Reshape back
+                    update_precond = update_precond_2d.view(update.shape)
+
+                    # Scale by aspect ratio (from original Muon paper)
+                    aspect_ratio = max(1, grad.size(-2) / grad.size(-1))
+                    update_precond *= aspect_ratio ** 0.5
+                else:
+                    # For 1D parameters, just use the update as-is
+                    update_precond = update
+
+                state['step'] += 1
+
+                # Apply weight decay (decoupled)
+                p.data.mul_(1 - lr * weight_decay)
+
+                # Apply update
+                p.data.add_(update_precond, alpha=-lr)
+
+        return loss
+
+
+#############################################
+#        Muon Residual Optimizer            #
+#############################################
+
+class MuonResidual(torch.optim.Optimizer):
+    r"""Muon optimizer with gradient residual regularization.
+
+    This optimizer combines orthogonalization (Muon) with a residual term that
+    captures the difference between the gradient and its square root preconditioner.
+
+    Update rule:
+        v_t = β v_{t-1} + (1-β) g_t                              (momentum)
+        u_orth = NS_zeroth_power(v_t)                            (orthogonalize)
+        u_sqrt = NS_sqrt(v_t)                                    (square root)
+        u_t = u_orth + γ * (v_t - u_sqrt)                        (residual)
+        W ← (1 - η*wd) W - η u_t                                 (update)
+
+    The key difference from HybridMuonRemez is:
+    - Instead of blending: λ*u_orth + (1-λ)*u_sqrt
+    - We use residual: u_orth + γ*(v_t - u_sqrt)
+
+    This allows the optimizer to maintain the orthogonalization benefits while
+    adding a scaled residual that captures information lost in the square root operation.
+
+    Arguments:
+        params (iterable): parameters to optimize
+        lr (float): learning rate (default: 1e-3)
+        momentum (float): momentum factor (default: 0.9)
+        nesterov (bool): whether to use Nesterov momentum (default: True)
+        weight_decay (float): weight decay (L2 penalty) (default: 0.0)
+        ns_steps (int): Newton-Schulz iterations (default: 5)
+        gamma (float): residual scaling factor (default: 0.1)
+            - gamma=0.0: Pure Muon (orthogonalization only)
+            - gamma>0.0: Adds residual term (gradient - sqrt)
+            - Typical range: [0.0, 0.5]
+
+    Example:
+        >>> optimizer = MuonResidual(
+        ...     model.parameters(),
+        ...     lr=0.0005,
+        ...     momentum=0.9,
+        ...     gamma=0.1
+        ... )
+        >>> optimizer.zero_grad()
+        >>> loss_fn(model(input), target).backward()
+        >>> optimizer.step()
+
+    Note:
+        - Memory efficient: computes both orthogonalization and sqrt but no blending
+        - The residual term (v_t - u_sqrt) provides gradient information
+        - Works best with 2D+ parameters (weight matrices)
+    """
+
+    def __init__(
+        self,
+        params: Iterable[torch.Tensor],
+        lr: float = 1e-3,
+        momentum: float = 0.9,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+        ns_steps: int = 5,
+        gamma: float = 0.1,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if momentum < 0.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+        if nesterov and momentum <= 0:
+            raise ValueError("Nesterov momentum requires a momentum value > 0")
+        if gamma < 0.0:
+            raise ValueError(f"Invalid gamma value: {gamma}")
+
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+            ns_steps=ns_steps,
+            gamma=gamma,
+        )
+        super(MuonResidual, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step with residual-regularized update."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            nesterov = group['nesterov']
+            weight_decay = group['weight_decay']
+            ns_steps = group['ns_steps']
+            gamma = group['gamma']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.data
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['momentum_buffer'] = torch.zeros_like(grad)
+
+                buf = state['momentum_buffer']
+
+                # Update momentum buffer: v_t = β v_{t-1} + (1-β) g_t
+                buf.lerp_(grad, 1 - momentum)
+
+                # Get update (with Nesterov if enabled)
+                if nesterov:
+                    update = grad.lerp(buf, momentum)
+                else:
+                    update = buf.clone()
+
+                # Apply matrix preconditioning with residual
+                if len(grad.shape) >= 2:
+                    # Reshape to matrix (first dim x product of rest)
+                    update_2d = update.view(len(update), -1)
+
+                    # Compute orthogonalization (Muon)
+                    muon_update_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
+
+                    if gamma > 0.0:
+                        # Compute square root (MuonRemez)
+                        sqrt_update_2d = compute_u_sigma_half_vt(
+                            update_2d, steps=ns_steps, variant='muon_aggressive'
+                        )
+
+                        # Residual: u_orth + γ * (v_t - u_sqrt)
+                        update_precond_2d = muon_update_2d + gamma * (update_2d - sqrt_update_2d)
+                    else:
+                        # Pure Muon when gamma=0
+                        update_precond_2d = muon_update_2d
 
                     # Reshape back
                     update_precond = update_precond_2d.view(update.shape)
@@ -944,6 +1104,23 @@ class MuonRemezConfig:
 
 
 @dataclass
+class MuonResidualConfig:
+    """Configuration for MuonResidual optimizer.
+
+    Attributes:
+        lr: Learning rate
+        momentum: Momentum factor for gradient smoothing
+        gamma: Residual scaling factor (controls contribution of gradient residual term)
+    """
+    lr: float = 0.0005
+    momentum: float = 0.9
+    gamma: float = 0.1
+
+    def __str__(self):
+        return f"MuonResidual_lr{self.lr}_mom{self.momentum}_gamma{self.gamma}"
+
+
+@dataclass
 class ShampooConfig:
     """Configuration for Shampoo optimizer.
     
@@ -1006,7 +1183,7 @@ class HybridMuonRemezConfig:
         if self.blend_decay_fraction == 0.0 or self.blend_start == self.blend_end:
             return f"HybridMR_lr{self.lr}_mom{self.momentum}_blend{self.blend_start}"
         else:
-            return f"HybridMR_lr{self.lr}_mom{self.momentum}_{self.blend_schedule}_b{self.blend_start}to{self.blend_end}"
+            return f"HybridMR_lr{self.lr}_mom{self.momentum}_{self.blend_schedule}_b{self.blend_start}to{self.blend_end}_decay{self.blend_decay_fraction}"
 
     def create_blend_schedule(self, total_train_steps: int):
         """Create blend schedule function based on config and total training steps.
@@ -1067,7 +1244,7 @@ class HybridMuonRemezConfig:
 
 
 # Type alias for optimizer configurations
-OptimizerConfig = Union[MuonConfig, MuonRemezConfig, ShampooConfig, AdamConfig, HybridMuonRemezConfig]
+OptimizerConfig = Union[MuonConfig, MuonRemezConfig, MuonResidualConfig, ShampooConfig, AdamConfig, HybridMuonRemezConfig]
 
 
 def parse_optimizer_config(config_str: str) -> OptimizerConfig:
@@ -1082,6 +1259,9 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
 
         >>> parse_optimizer_config("MuonRemez:lr=0.0005,momentum=0.9")
         MuonRemezConfig(lr=0.0005, momentum=0.9)
+
+        >>> parse_optimizer_config("MuonResidual:lr=0.0005,momentum=0.9,gamma=0.1")
+        MuonResidualConfig(lr=0.0005, momentum=0.9, gamma=0.1)
 
         >>> parse_optimizer_config("Shampoo:lr=0.0005,momentum=0.9,order_multiplier=2")
         ShampooConfig(lr=0.0005, momentum=0.9, order_multiplier=2)
@@ -1139,6 +1319,8 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
         return MuonConfig(**params)
     elif opt_type == 'muonremez':
         return MuonRemezConfig(**params)
+    elif opt_type == 'muonresidual':
+        return MuonResidualConfig(**params)
     elif opt_type == 'shampoo':
         return ShampooConfig(**params)
     elif opt_type == 'adam':
@@ -1148,7 +1330,7 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
     else:
         raise ValueError(
             f"Unknown optimizer type: {opt_type}. "
-            f"Valid types: 'muon', 'muonremez', 'shampoo', 'adam', 'hybridmuonremez'"
+            f"Valid types: 'muon', 'muonremez', 'muonresidual', 'shampoo', 'adam', 'hybridmuonremez'"
         )
 
 
@@ -1246,7 +1428,7 @@ def create_optimizer(
         )
         optimizers.append(adam_opt)
 
-    # Create main optimizer for filter params (Shampoo, Muon, MuonRemez, or HybridMuonRemez)
+    # Create main optimizer for filter params (Shampoo, Muon, MuonRemez, MuonResidual, or HybridMuonRemez)
     if len(filter_params) > 0:
         if isinstance(config, MuonConfig):
             main_opt = Muon(
@@ -1264,6 +1446,16 @@ def create_optimizer(
                 momentum=config.momentum,
                 nesterov=True,
                 weight_decay=weight_decay
+            )
+            optimizers.append(main_opt)
+        elif isinstance(config, MuonResidualConfig):
+            main_opt = MuonResidual(
+                filter_params,
+                lr=config.lr,
+                momentum=config.momentum,
+                nesterov=True,
+                weight_decay=weight_decay,
+                gamma=config.gamma
             )
             optimizers.append(main_opt)
         elif isinstance(config, ShampooConfig):
@@ -1294,7 +1486,7 @@ def create_optimizer(
         else:
             raise ValueError(
                 f"Unknown optimizer config: {type(config)}. "
-                f"Expected MuonConfig, MuonRemezConfig, ShampooConfig, or HybridMuonRemezConfig."
+                f"Expected MuonConfig, MuonRemezConfig, MuonResidualConfig, ShampooConfig, or HybridMuonRemezConfig."
             )
 
     return optimizers
