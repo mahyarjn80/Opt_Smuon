@@ -752,6 +752,8 @@ class HybridMuonRemez(torch.optim.Optimizer):
                 blend_coeff = self.blend_schedule_fn(state['step'])
                 blend_coeff = max(0.0, min(1.0, blend_coeff))  # Clamp to [0, 1]
 
+                print(f"coeff is {blend_coeff}")
+
                 # Apply matrix preconditioning (blend Muon and MuonRemez)
                 if len(grad.shape) >= 2:
                     # Reshape to matrix (first dim x product of rest)
