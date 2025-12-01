@@ -398,7 +398,7 @@ class Muon(torch.optim.Optimizer):
         params: Iterable[torch.Tensor],
         lr: float = 1e-3,
         momentum: float = 0.0,
-        nesterov: bool = False,
+        nesterov: bool = True,
         weight_decay: float = 0.0,
     ):
         if lr < 0.0:
@@ -741,8 +741,12 @@ class HybridMuonRemez(torch.optim.Optimizer):
                 # Get update (with Nesterov if enabled)
                 if nesterov:
                     update = grad.lerp(buf, momentum)
+                    # Bias correction for Nesterov
+                    bias_correction = 1 / (1 - momentum ** (state['step'] + 2))
                 else:
                     update = buf.clone()
+                    # Bias correction
+                    bias_correction = 1 / (1 - momentum ** (state['step'] + 1))
 
                 # Get blend coefficient for this step
                 blend_coeff = self.blend_schedule_fn(state['step'])
@@ -755,17 +759,17 @@ class HybridMuonRemez(torch.optim.Optimizer):
 
 
                     if blend_coeff == 0.0:
-                        update_precond_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
-                        # update_precond_2d = compute_u_sigma_half_vt(
-                        #     update_2d, steps=ns_steps, variant='muon_aggressive'
-                        # )
+                        # update_precond_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
+                        update_precond_2d = compute_u_sigma_half_vt(
+                            update_2d, steps=ns_steps, variant='muon_aggressive'
+                        )
                     else:
                         # Blend both
                         muon_update_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
                         remez_update_2d = compute_u_sigma_half_vt(
                             update_2d, steps=ns_steps, variant='muon_aggressive'
                         )
-                        update_precond_2d =  muon_update_2d + (blend_coeff) * remez_update_2d
+                        update_precond_2d =  (1)*muon_update_2d + (blend_coeff) * remez_update_2d
 
                     # Reshape back
                     update_precond = update_precond_2d.view(update.shape)
