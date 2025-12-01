@@ -755,14 +755,17 @@ class HybridMuonRemez(torch.optim.Optimizer):
 
 
                     if blend_coeff == 0.0:
-                        update_precond_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
+                        # update_precond_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
+                        update_precond_2d = compute_u_sigma_half_vt(
+                            update_2d, steps=ns_steps, variant='muon_aggressive'
+                        )
                     else:
                         # Blend both
                         muon_update_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
                         remez_update_2d = compute_u_sigma_half_vt(
                             update_2d, steps=ns_steps, variant='muon_aggressive'
                         )
-                        update_precond_2d =  (1-blend_coeff)*muon_update_2d + blend_coeff * remez_update_2d
+                        update_precond_2d =  (blend_coeff)*muon_update_2d + (1-blend_coeff) * remez_update_2d
 
                     # Reshape back
                     update_precond = update_precond_2d.view(update.shape)
