@@ -753,7 +753,7 @@ class HybridMuonRemez(torch.optim.Optimizer):
                 blend_coeff = max(0.0, min(1.0, blend_coeff))  # Clamp to [0, 1]
 
                 # Debug: print once per 100 steps for first parameter only
-                if state['step'] % 100 == 0:
+                if state['step'] % 2 == 0:
                     print(f"[DEBUG HybridMuonRemez] step={state['step']}, blend_coeff={blend_coeff:.4f}, schedule_fn result={self.blend_schedule_fn(state['step']):.4f}")
 
                 # Apply matrix preconditioning (blend Muon and MuonRemez)
@@ -1221,7 +1221,7 @@ class HybridMuonRemezConfig:
                 progress = step / decay_steps
                 result = self.blend_start + progress * (self.blend_end - self.blend_start)
                 # Debug: print occasionally
-                if step % 500 == 0:
+                if step % 2 == 0:
                     print(f"[DEBUG linear_blend] step={step}, decay_steps={decay_steps}, progress={progress:.4f}, result={result:.4f}")
                 return result
             return linear_blend
