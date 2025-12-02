@@ -540,31 +540,33 @@ def compute_gradient_statistics(model: nn.Module, param_name: str = None) -> Dic
     return stats
 
 
-def compute_gradient_spectra(model: nn.Module, param_names: List[str]) -> Dict[str, Dict[str, Any]]:
+def compute_gradient_spectra(model: nn.Module, param_names: List[str], lr: float = 1.0) -> Dict[str, Dict[str, Any]]:
     """
-    Compute gradient spectra for multiple parameters.
+    Compute gradient spectra for multiple parameters, scaled by learning rate.
 
-    This function computes the spectrum (singular values) of gradients for all specified
-    parameters, enabling analysis of gradient flow, conditioning, and optimization dynamics
-    across multiple layers.
+    This function computes the spectrum (singular values) of lr-scaled gradients for all
+    specified parameters, enabling analysis of actual update magnitudes and optimization
+    dynamics across multiple layers.
 
     Args:
         model: PyTorch model
         param_names: List of parameter names to track
+        lr: Learning rate to scale gradients by (default: 1.0 for unscaled)
 
     Returns:
         Dictionary mapping parameter names to their gradient statistics:
-            - 'spectrum': Singular values of gradient (numpy array)
-            - 'frobenius_norm': Frobenius norm ||∇||_F
-            - 'spectral_norm': Spectral norm (largest singular value) ||∇||_2
-            - 'trace': Trace of gradient Gram matrix Tr(∇^T∇)
+            - 'spectrum': Singular values of lr*gradient (numpy array)
+            - 'frobenius_norm': Frobenius norm ||lr*∇||_F
+            - 'spectral_norm': Spectral norm (largest singular value) ||lr*∇||_2
+            - 'trace': Trace of (lr*∇)^T(lr*∇)
 
     Example:
         >>> # During training, after loss.backward()
         >>> param_names = ['layers.0.conv1.weight', 'layers.1.conv1.weight']
-        >>> grad_spectra = compute_gradient_spectra(model, param_names)
+        >>> lr = optimizer.param_groups[0]['lr']
+        >>> grad_spectra = compute_gradient_spectra(model, param_names, lr=lr)
         >>> for name, stats in grad_spectra.items():
-        ...     print(f"{name}: spectral norm = {stats['spectral_norm']:.2e}")
+        ...     print(f"{name}: lr-scaled spectral norm = {stats['spectral_norm']:.2e}")
     """
     gradient_spectra = {}
 
@@ -595,12 +597,15 @@ def compute_gradient_spectra(model: nn.Module, param_names: List[str]) -> Dict[s
                 # Compute SVD to get spectrum
                 _, s, _ = torch.svd(grad_cpu)
 
-                # Store statistics
+                # Scale singular values by learning rate
+                s_scaled = s * lr
+
+                # Store statistics (all scaled by lr)
                 gradient_spectra[param_name] = {
-                    'spectrum': s.numpy(),
-                    'spectral_norm': s[0].item(),
-                    'frobenius_norm': torch.linalg.norm(grad_cpu, ord='fro').item(),
-                    'trace': (s ** 2).sum().item()
+                    'spectrum': s_scaled.numpy(),
+                    'spectral_norm': s_scaled[0].item(),
+                    'frobenius_norm': torch.linalg.norm(grad_cpu, ord='fro').item() * lr,
+                    'trace': (s_scaled ** 2).sum().item()
                 }
 
             except Exception as e:

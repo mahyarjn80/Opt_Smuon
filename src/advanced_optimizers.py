@@ -769,7 +769,7 @@ class HybridMuonRemez(torch.optim.Optimizer):
                         remez_update_2d = compute_u_sigma_half_vt(
                             update_2d, steps=ns_steps, variant='muon_aggressive'
                         )
-                        update_precond_2d =  (blend_coeff)*muon_update_2d + (1) * remez_update_2d
+                        update_precond_2d =  (1)*muon_update_2d + (blend_coeff) * (update_2d - remez_update_2d)
 
                     # Reshape back
                     update_precond = update_precond_2d.view(update.shape)

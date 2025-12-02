@@ -247,8 +247,13 @@ def main(
 
                 # Compute gradient statistics BEFORE optimizer step (captures raw gradients)
                 if step % svd_freq == 0:
-                    # Compute gradient spectra for all filter layers
-                    grad_spectra = compute_gradient_spectra(model, filter_param_names_dict[model_name])
+                    # Get learning rate for filter parameters (from main optimizer)
+                    opts = optimizers_dict[model_name]
+                    # Filter params are in the last optimizer (main optimizer like Muon/Shampoo)
+                    filter_lr = opts[-1].param_groups[0]['lr']
+
+                    # Compute gradient spectra for all filter layers (scaled by lr)
+                    grad_spectra = compute_gradient_spectra(model, filter_param_names_dict[model_name], lr=filter_lr)
                     gradient_spectra_logs[model_name].append((step, grad_spectra))
 
                     # Also compute for single important layer (if exists)
