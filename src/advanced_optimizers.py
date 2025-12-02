@@ -910,8 +910,12 @@ class MuonResidual(torch.optim.Optimizer):
                 # Get update (with Nesterov if enabled)
                 if nesterov:
                     update = grad.lerp(buf, momentum)
+                    # Bias correction for Nesterov
+                    bias_correction = 1.02 / (1 - momentum ** (state['step'] + 2))
                 else:
                     update = buf.clone()
+                    # Bias correction
+                    bias_correction = 1.02 / (1 - momentum ** (state['step'] + 1))
 
                 # Apply matrix preconditioning with residual
                 if len(grad.shape) >= 2:
