@@ -276,7 +276,7 @@ def main(
                         optimizers=opts,
                         lr=filter_lr,
                         scale_by_lr=False,
-                        use_momentum=True  # Set to True to analyze momentum buffers instead
+                        use_momentum=False  # Set to True to analyze momentum buffers instead
                     )
                     gradient_spectra_logs[model_name].append((step, grad_spectra))
 
