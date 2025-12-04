@@ -611,9 +611,11 @@ def compute_gradient_spectra(
         if optimizers is None:
             raise ValueError("optimizers must be provided when use_momentum=True")
         for optimizer in optimizers:
-            for param in optimizer.param_groups[0]['params']:
-                if param in optimizer.state:
-                    param_to_state[id(param)] = optimizer.state[param]
+            # Iterate through ALL parameter groups, not just the first one
+            for param_group in optimizer.param_groups:
+                for param in param_group['params']:
+                    if param in optimizer.state:
+                        param_to_state[id(param)] = optimizer.state[param]
 
     with torch.no_grad():
         for param_name in param_names:
@@ -630,9 +632,18 @@ def compute_gradient_spectra(
             # Get the data to analyze (gradient or momentum buffer)
             if use_momentum:
                 state = param_to_state.get(id(param))
-                if state is None or 'momentum_buffer' not in state:
+                if state is None:
                     continue
-                data = state['momentum_buffer']
+
+                # Different optimizers store momentum under different keys
+                # Muon/Shampoo/SGD: 'momentum_buffer'
+                # Adam/AdamW: 'exp_avg' (first moment)
+                if 'momentum_buffer' in state:
+                    data = state['momentum_buffer']
+                elif 'exp_avg' in state:
+                    data = state['exp_avg']
+                else:
+                    continue
             else:
                 if param.grad is None:
                     continue
