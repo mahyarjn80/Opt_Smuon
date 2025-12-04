@@ -74,7 +74,10 @@ class LossAndAccuracyLogger(ModelLogger):
         with torch.no_grad():
             # For CifarLoader-style loaders
             if hasattr(loader, 'normalize') and hasattr(loader, 'images'):
-                images = loader.normalize(loader.images).float()
+                images = loader.normalize(loader.images)
+                # Convert to float32 only for MNIST/Fashion-MNIST (MNISTLoader stores as half precision)
+                if hasattr(loader, 'mean'):  # MNISTLoader has this attribute
+                    images = images.float()
                 labels = loader.labels
                 
                 # Process in batches
