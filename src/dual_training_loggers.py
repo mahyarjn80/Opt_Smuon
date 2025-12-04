@@ -540,35 +540,57 @@ def compute_gradient_statistics(model: nn.Module, param_name: str = None) -> Dic
     return stats
 
 
-def compute_gradient_spectra(model: nn.Module, param_names: List[str], lr: float = 1.0) -> Dict[str, Dict[str, Any]]:
+def compute_gradient_spectra(
+    model: nn.Module,
+    param_names: List[str],
+    optimizers: List[torch.optim.Optimizer] = None,
+    lr: float = 1.0,
+    scale_by_lr: bool = False,
+    use_momentum: bool = False
+) -> Dict[str, Dict[str, Any]]:
     """
-    Compute gradient spectra for multiple parameters, scaled by learning rate.
+    Compute gradient spectra for multiple parameters.
 
-    This function computes the spectrum (singular values) of lr-scaled gradients for all
-    specified parameters, enabling analysis of actual update magnitudes and optimization
-    dynamics across multiple layers.
+    This function computes the spectrum (singular values) of gradients or momentum buffers
+    for specified parameters, optionally scaled by learning rate.
 
     Args:
         model: PyTorch model
         param_names: List of parameter names to track
-        lr: Learning rate to scale gradients by (default: 1.0 for unscaled)
+        optimizers: List of optimizers (required if use_momentum=True or scale_by_lr=True)
+        lr: Learning rate to scale by (used if scale_by_lr=True)
+        scale_by_lr: If True, scale all statistics by learning rate
+        use_momentum: If True, compute spectra of momentum buffers instead of raw gradients
+                      (requires optimizers to be provided)
 
     Returns:
-        Dictionary mapping parameter names to their gradient statistics:
-            - 'spectrum': Singular values of lr*gradient (numpy array)
-            - 'frobenius_norm': Frobenius norm ||lr*∇||_F
-            - 'spectral_norm': Spectral norm (largest singular value) ||lr*∇||_2
-            - 'trace': Trace of (lr*∇)^T(lr*∇)
+        Dictionary mapping parameter names to their gradient/momentum statistics:
+            - 'spectrum': Singular values of gradient or momentum (numpy array)
+            - 'frobenius_norm': Frobenius norm
+            - 'spectral_norm': Spectral norm (largest singular value)
+            - 'trace': Trace of Gram matrix
 
     Example:
-        >>> # During training, after loss.backward()
-        >>> param_names = ['layers.0.conv1.weight', 'layers.1.conv1.weight']
-        >>> lr = optimizer.param_groups[0]['lr']
-        >>> grad_spectra = compute_gradient_spectra(model, param_names, lr=lr)
-        >>> for name, stats in grad_spectra.items():
-        ...     print(f"{name}: lr-scaled spectral norm = {stats['spectral_norm']:.2e}")
+        >>> # Raw gradient spectra
+        >>> grad_spectra = compute_gradient_spectra(model, param_names)
+
+        >>> # Momentum buffer spectra, scaled by lr
+        >>> grad_spectra = compute_gradient_spectra(
+        ...     model, param_names, optimizers=opts, lr=0.001,
+        ...     scale_by_lr=True, use_momentum=True
+        ... )
     """
     gradient_spectra = {}
+
+    # Build mapping from parameter id to optimizer state (if using momentum)
+    param_to_state = {}
+    if use_momentum:
+        if optimizers is None:
+            raise ValueError("optimizers must be provided when use_momentum=True")
+        for optimizer in optimizers:
+            for param in optimizer.param_groups[0]['params']:
+                if param in optimizer.state:
+                    param_to_state[id(param)] = optimizer.state[param]
 
     with torch.no_grad():
         for param_name in param_names:
@@ -579,33 +601,46 @@ def compute_gradient_spectra(model: nn.Module, param_names: List[str], lr: float
                     param = p
                     break
 
-            if param is None or param.grad is None:
+            if param is None:
                 continue
 
-            grad = param.grad.data
+            # Get the data to analyze (gradient or momentum buffer)
+            if use_momentum:
+                state = param_to_state.get(id(param))
+                if state is None or 'momentum_buffer' not in state:
+                    continue
+                data = state['momentum_buffer']
+            else:
+                if param.grad is None:
+                    continue
+                data = param.grad.data
 
             # Reshape to 2D if needed
-            if grad.ndim == 2:
-                grad_2d = grad
+            if data.ndim == 2:
+                data_2d = data
             else:
-                grad_2d = grad.reshape(grad.size(0), -1)
+                data_2d = data.reshape(data.size(0), -1)
 
             try:
                 # Move to CPU and convert to float32 for numerical stability
-                grad_cpu = grad_2d.cpu().float()
+                data_cpu = data_2d.cpu().float()
 
                 # Compute SVD to get spectrum
-                _, s, _ = torch.svd(grad_cpu)
+                _, s, _ = torch.svd(data_cpu)
 
-                # Scale singular values by learning rate
-                s_scaled = s * lr
+                # Optionally scale by learning rate
+                if scale_by_lr:
+                    s = s * lr
+                    scale_factor = lr
+                else:
+                    scale_factor = 1.0
 
-                # Store statistics (all scaled by lr)
+                # Store statistics
                 gradient_spectra[param_name] = {
-                    'spectrum': s_scaled.numpy(),
-                    'spectral_norm': s_scaled[0].item(),
-                    'frobenius_norm': torch.linalg.norm(grad_cpu, ord='fro').item() * lr,
-                    'trace': (s_scaled ** 2).sum().item()
+                    'spectrum': s.numpy(),
+                    'spectral_norm': s[0].item(),
+                    'frobenius_norm': torch.linalg.norm(data_cpu, ord='fro').item() * scale_factor,
+                    'trace': (s ** 2).sum().item()
                 }
 
             except Exception as e:

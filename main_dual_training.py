@@ -253,7 +253,14 @@ def main(
                     filter_lr = opts[-1].param_groups[0]['lr']
 
                     # Compute gradient spectra for all filter layers (scaled by lr)
-                    grad_spectra = compute_gradient_spectra(model, filter_param_names_dict[model_name], lr=filter_lr)
+                    grad_spectra = compute_gradient_spectra(
+                        model,
+                        filter_param_names_dict[model_name],
+                        optimizers=opts,
+                        lr=filter_lr,
+                        scale_by_lr=False,
+                        use_momentum=True  # Set to True to analyze momentum buffers instead
+                    )
                     gradient_spectra_logs[model_name].append((step, grad_spectra))
 
                     # Also compute for single important layer (if exists)
