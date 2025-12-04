@@ -1,10 +1,11 @@
 """
-Data loading utilities for CIFAR-10 training.
+Data loading utilities for CIFAR-10, MNIST, and Fashion-MNIST training.
 
 This module provides:
 - CifarLoader: Efficient data loader for CIFAR-10 with augmentation support
+- MNISTLoader: Efficient data loader for MNIST and Fashion-MNIST
 - Augmentation functions: batch_flip_lr, batch_crop
-- CIFAR-10 normalization constants
+- Normalization constants for all datasets
 """
 
 import os
@@ -19,6 +20,14 @@ import torchvision.transforms as T
 # CIFAR-10 normalization constants
 CIFAR_MEAN = torch.tensor((0.4914, 0.4822, 0.4465))
 CIFAR_STD = torch.tensor((0.2470, 0.2435, 0.2616))
+
+# MNIST normalization constants
+MNIST_MEAN = torch.tensor((0.1307,))
+MNIST_STD = torch.tensor((0.3081,))
+
+# Fashion-MNIST normalization constants (similar to MNIST)
+FASHION_MNIST_MEAN = torch.tensor((0.2860,))
+FASHION_MNIST_STD = torch.tensor((0.3530,))
 
 
 def batch_flip_lr(inputs):
@@ -173,6 +182,132 @@ class CifarLoader:
         # Generate batch indices (shuffled or sequential)
         indices = (torch.randperm if self.shuffle else torch.arange)(len(images), device=images.device)
         
+        # Yield batches
+        for i in range(len(self)):
+            idxs = indices[i*self.batch_size:(i+1)*self.batch_size]
+            yield (images[idxs], self.labels[idxs])
+
+
+class MNISTLoader:
+    """
+    High-performance MNIST/Fashion-MNIST data loader with optional augmentation.
+
+    Features:
+    - Loads entire dataset to GPU for fast access
+    - Supports horizontal flipping and random cropping
+    - Uses half precision (float16) for memory efficiency
+    - Works with both MNIST and Fashion-MNIST
+
+    Args:
+        path: Directory to store/load data
+        train: If True, load training set; otherwise load test set
+        batch_size: Number of samples per batch
+        dataset: 'mnist' or 'fashion_mnist'
+        aug: Dictionary of augmentation options. Supported keys:
+            - 'flip': bool, enable horizontal flipping
+            - 'translate': int, amount of random translation (in pixels)
+
+    Example:
+        >>> loader = MNISTLoader('data', train=True, batch_size=128, dataset='mnist')
+        >>> for images, labels in loader:
+        ...     # images: [batch_size, 1, 28, 28]
+        ...     # labels: [batch_size]
+        ...     pass
+    """
+
+    def __init__(self, path, train=True, batch_size=500, dataset='mnist', aug=None):
+        # Select dataset
+        if dataset.lower() == 'mnist':
+            dataset_class = torchvision.datasets.MNIST
+            mean, std = MNIST_MEAN, MNIST_STD
+            data_name = 'mnist'
+        elif dataset.lower() == 'fashion_mnist' or dataset.lower() == 'fashionmnist':
+            dataset_class = torchvision.datasets.FashionMNIST
+            mean, std = FASHION_MNIST_MEAN, FASHION_MNIST_STD
+            data_name = 'fashion_mnist'
+        else:
+            raise ValueError(f"Unknown dataset: {dataset}. Must be 'mnist' or 'fashion_mnist'")
+
+        data_path = os.path.join(path, f'{data_name}_{"train" if train else "test"}.pt')
+
+        # Download and save dataset if not exists
+        if not os.path.exists(data_path):
+            os.makedirs(path, exist_ok=True)
+            dset = dataset_class(path, download=True, train=train)
+            images = torch.tensor(dset.data.numpy())  # Convert from PIL/numpy
+            labels = torch.tensor(dset.targets)
+            classes = dset.classes if hasattr(dset, 'classes') else [str(i) for i in range(10)]
+            torch.save({'images': images, 'labels': labels, 'classes': classes}, data_path)
+
+        # Load dataset to GPU (or CPU if CUDA not available)
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        data = torch.load(data_path, map_location=torch.device(device))
+        self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
+
+        # Convert to half precision and add channel dimension
+        # MNIST images are grayscale: [N, 28, 28] -> [N, 1, 28, 28]
+        self.images = (self.images.half() / 255).unsqueeze(1).to(memory_format=torch.channels_last)
+
+        # Normalization transform
+        self.normalize = T.Normalize(mean, std)
+        self.mean = mean
+        self.std = std
+
+        # Cached processed images (populated on first epoch)
+        self.proc_images = {}
+        self.epoch = 0
+
+        # Validate and store augmentation config
+        self.aug = aug or {}
+        for k in self.aug.keys():
+            assert k in ['flip', 'translate'], f'Unrecognized augmentation key: {k}'
+
+        # Batch configuration
+        self.batch_size = batch_size
+        self.drop_last = train
+        self.shuffle = train
+
+    def __len__(self):
+        """Return number of batches in an epoch."""
+        if self.drop_last:
+            return len(self.images) // self.batch_size
+        else:
+            return ceil(len(self.images) / self.batch_size)
+
+    def __iter__(self):
+        """Iterate over batches of (images, labels)."""
+
+        # First epoch: preprocess images
+        if self.epoch == 0:
+            images = self.proc_images['norm'] = self.normalize(self.images)
+
+            # Pre-flip images in order to do every-other epoch flipping scheme
+            if self.aug.get('flip', False):
+                images = self.proc_images['flip'] = batch_flip_lr(images)
+
+            # Pre-pad images to save time when doing random translation
+            pad = self.aug.get('translate', 0)
+            if pad > 0:
+                self.proc_images['pad'] = F.pad(images, (pad,)*4, 'reflect')
+
+        # Select appropriate image source based on augmentation
+        if self.aug.get('translate', 0) > 0:
+            images = batch_crop(self.proc_images['pad'], self.images.shape[-2])
+        elif self.aug.get('flip', False):
+            images = self.proc_images['flip']
+        else:
+            images = self.proc_images['norm']
+
+        # Flip all images together every other epoch
+        if self.aug.get('flip', False):
+            if self.epoch % 2 == 1:
+                images = images.flip(-1)
+
+        self.epoch += 1
+
+        # Generate batch indices (shuffled or sequential)
+        indices = (torch.randperm if self.shuffle else torch.arange)(len(images), device=images.device)
+
         # Yield batches
         for i in range(len(self)):
             idxs = indices[i*self.batch_size:(i+1)*self.batch_size]

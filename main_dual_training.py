@@ -23,7 +23,7 @@ from src.dual_training_loggers import (
     compute_gradient_statistics, compute_gradient_spectra, get_important_conv_layer,
     DEFAULT_LOGGING_COLUMNS
 )
-from src.data import CifarLoader, CIFAR_MEAN, CIFAR_STD
+from src.data import CifarLoader, MNISTLoader, CIFAR_MEAN, CIFAR_STD, MNIST_MEAN, MNIST_STD, FASHION_MNIST_MEAN, FASHION_MNIST_STD
 from src.eval import evaluate
 from src.param_groups import get_param_groups
 # os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -39,22 +39,23 @@ ValidArch = Union[CNN, MLP, VIT, LSTM, Mamba, Transformer, Resnet, CifarNet]
 
 def main(
     arch: ValidArch,
-    optimizer_configs_str: List[str] = None,          
-    optimizer_configs: List[OptimizerConfig] = None,  
-    data_path: str = "cifar10",       
-    batch_size: int = 2048,   
-    lr_bias: float = 0.053,            
-    lr_head: float = 0.67,          
-    weight_decay: float = 1e-4,     
-    weight_decay_misc: float = 1e-4,     
+    optimizer_configs_str: List[str] = None,
+    optimizer_configs: List[OptimizerConfig] = None,
+    data_path: str = "cifar10",
+    dataset: str = "cifar10",  # 'cifar10', 'mnist', or 'fashion_mnist'
+    batch_size: int = 2048,
+    lr_bias: float = 0.053,
+    lr_head: float = 0.67,
+    weight_decay: float = 1e-4,
+    weight_decay_misc: float = 1e-4,
     batch_sweep_count: int = 20,
-    use_augmentation: bool = True,    
-    label_smoothing: float = 0.2,     
-    device: str = "cuda",             
-    seed: int = 0,                    
-    save_results: bool = True,        
-    svd_freq: int = 20,               
-    total_train_steps: int = 400,     
+    use_augmentation: bool = True,
+    label_smoothing: float = 0.2,
+    device: str = "cuda",
+    seed: int = 0,
+    save_results: bool = True,
+    svd_freq: int = 20,
+    total_train_steps: int = 400,
 ):
 
     if optimizer_configs_str is not None:
@@ -99,13 +100,28 @@ def main(
     
 
     print("\n[1/5] Loading Data...")
-    aug = dict(flip=True, translate=2) if use_augmentation else {}
-    train_loader = CifarLoader(data_path, train=True, batch_size=batch_size, aug=aug)
-    test_loader = CifarLoader(data_path, train=False, batch_size=2000)
+
+    # Determine dataset parameters
+    dataset_lower = dataset.lower()
+    if dataset_lower == 'cifar10':
+        aug = dict(flip=True, translate=2) if use_augmentation else {}
+        train_loader = CifarLoader(data_path, train=True, batch_size=batch_size, aug=aug)
+        test_loader = CifarLoader(data_path, train=False, batch_size=2000)
+        input_shape = (3, 32, 32)  # CIFAR-10: RGB 32x32
+    elif dataset_lower in ['mnist', 'fashion_mnist', 'fashionmnist']:
+        aug = dict(flip=True, translate=2) if use_augmentation else {}
+        train_loader = MNISTLoader(data_path, train=True, batch_size=batch_size, dataset=dataset_lower, aug=aug)
+        test_loader = MNISTLoader(data_path, train=False, batch_size=2000, dataset=dataset_lower)
+        input_shape = (1, 28, 28)  # MNIST/Fashion-MNIST: Grayscale 28x28
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}. Must be 'cifar10', 'mnist', or 'fashion_mnist'")
+
     total_train_steps = ceil(batch_sweep_count * len(train_loader))
     total_epochs = ceil(total_train_steps / len(train_loader))
+    print(f"  - Dataset: {dataset}")
     print(f"  - Training samples: {len(train_loader.images)}")
     print(f"  - Test samples: {len(test_loader.images)}")
+    print(f"  - Input shape: {input_shape}")
     print(f"  - Batch size: {batch_size}")
     print(f"  - Total steps: {total_train_steps}")
     print(f"  - Total epochs: {total_epochs}")
@@ -114,20 +130,20 @@ def main(
     
     print("\n[2/5] Creating Models...")
     models = {}
-    base_model = arch.create(input_shape=(3, 32, 32), output_dim=10).to(device)
-    
+    base_model = arch.create(input_shape=input_shape, output_dim=10).to(device)
+
     # Initialize whitening layer for CifarNet
     if param_group_strategy == 'cifarnet' and hasattr(base_model, 'init_whiten'):
         print("  - Initializing whitening layer for CifarNet...")
         train_images = train_loader.normalize(train_loader.images[:5000])
         base_model.init_whiten(train_images)
-    
+
     base_state_dict = base_model.state_dict()
-    
+
     for i, opt_config in enumerate(optimizer_configs):
         model_name = f"{opt_config}"
-        model = arch.create(input_shape=(3, 32, 32), output_dim=10).to(device)
-        model.load_state_dict(base_state_dict)  
+        model = arch.create(input_shape=input_shape, output_dim=10).to(device)
+        model.load_state_dict(base_state_dict)
         models[model_name] = model
         print(f"  - Model {i+1}: {model_name}")
     

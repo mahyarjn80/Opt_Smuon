@@ -438,7 +438,8 @@ def get_important_conv_layer(model: nn.Module, method : str = None) -> str:
 
     For VIT: selects transformer.layers.3.0.to_qkv.weight
     For CifarNet: selects the first conv in the first ConvGroup (layers.0.conv1)
-    For other architectures: selects the first Conv2d layer found
+    For MLP: selects the first 2D layer (typically layers.0.weight)
+    For other architectures: selects the first Conv2d or Linear layer found
 
     Args:
         model: PyTorch model
@@ -457,10 +458,29 @@ def get_important_conv_layer(model: nn.Module, method : str = None) -> str:
         if any(n == name for n, _ in model.named_parameters()):
             return name
 
-    # Fallback: find first Conv2d layer
+    # For MLP: use first linear layer (Sequential uses numeric indices)
+    for name in ['1.weight', '0.weight', 'layers.0.weight', 'layers.1.weight', 'fc1.weight', 'linear1.weight']:
+        param = None
+        for n, p in model.named_parameters():
+            if n == name:
+                param = p
+                break
+        # Check if it's a 2D parameter (Linear layer)
+        if param is not None and param.ndim == 2:
+            return name
+
+    # Fallback: find first Conv2d or Linear layer
     for name, module in model.named_modules():
-        if isinstance(module, nn.Conv2d) and any(n.startswith(name + '.weight') for n, _ in model.named_parameters()):
-            return name + '.weight'
+        if isinstance(module, nn.Conv2d):
+            param_name = name + '.weight'
+            if any(n == param_name for n, _ in model.named_parameters()):
+                return param_name
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            param_name = name + '.weight'
+            if any(n == param_name for n, _ in model.named_parameters()):
+                return param_name
 
     return None
 
