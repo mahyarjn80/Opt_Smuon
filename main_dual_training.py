@@ -109,7 +109,8 @@ def main(
         test_loader = CifarLoader(data_path, train=False, batch_size=2000)
         input_shape = (3, 32, 32)  # CIFAR-10: RGB 32x32
     elif dataset_lower in ['mnist', 'fashion_mnist', 'fashionmnist']:
-        aug = dict(flip=True, translate=2) if use_augmentation else {}
+        # Don't use flip/translate augmentation for MNIST (batch_crop is designed for RGB)
+        aug = {}
         train_loader = MNISTLoader(data_path, train=True, batch_size=batch_size, dataset=dataset_lower, aug=aug)
         test_loader = MNISTLoader(data_path, train=False, batch_size=2000, dataset=dataset_lower)
         input_shape = (1, 28, 28)  # MNIST/Fashion-MNIST: Grayscale 28x28
