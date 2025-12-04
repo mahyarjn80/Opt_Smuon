@@ -308,8 +308,7 @@ class MNISTLoader:
         # Generate batch indices (shuffled or sequential)
         indices = (torch.randperm if self.shuffle else torch.arange)(len(images), device=images.device)
 
-        # Yield batches
+        # Yield batches (convert to float32 for compatibility with all model types)
         for i in range(len(self)):
             idxs = indices[i*self.batch_size:(i+1)*self.batch_size]
-            yield (images[idxs], self.labels[idxs])
-
+            yield (images[idxs].float(), self.labels[idxs])
