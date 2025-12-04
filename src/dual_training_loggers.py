@@ -74,7 +74,7 @@ class LossAndAccuracyLogger(ModelLogger):
         with torch.no_grad():
             # For CifarLoader-style loaders
             if hasattr(loader, 'normalize') and hasattr(loader, 'images'):
-                images = loader.normalize(loader.images)
+                images = loader.normalize(loader.images).float()
                 labels = loader.labels
                 
                 # Process in batches
