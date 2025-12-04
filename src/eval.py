@@ -39,7 +39,7 @@ def evaluate(model: nn.Module, loader, device: str = 'cuda', batch_size: int = 2
     with torch.no_grad():
         # For CifarLoader-style loaders (images already on device)
         if hasattr(loader, 'normalize') and hasattr(loader, 'images'):
-            test_images = loader.normalize(loader.images)
+            test_images = loader.normalize(loader.images).float()
             labels = loader.labels
             
             # Process in batches to avoid memory issues
@@ -106,7 +106,7 @@ def evaluate_with_label_smoothing(
     with torch.no_grad():
         # For CifarLoader-style loaders
         if hasattr(loader, 'normalize') and hasattr(loader, 'images'):
-            test_images = loader.normalize(loader.images)
+            test_images = loader.normalize(loader.images).float()
             labels = loader.labels
             
             for i in range(0, len(test_images), batch_size):
