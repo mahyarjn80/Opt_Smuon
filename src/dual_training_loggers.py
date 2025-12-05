@@ -488,30 +488,44 @@ def get_important_conv_layer(model: nn.Module, method : str = None) -> str:
     return None
 
 
-def compute_gradient_statistics(model: nn.Module, param_name: str = None) -> Dict[str, Any]:
+def compute_gradient_statistics(
+    model: nn.Module,
+    param_name: str = None,
+    optimizers: List[torch.optim.Optimizer] = None,
+    lr: float = 1.0,
+    scale_by_lr: bool = False,
+    use_momentum: bool = False
+) -> Dict[str, Any]:
     """
     Compute comprehensive gradient statistics for a specific parameter.
 
     Tracks gradient spectrum (singular values), norms, and trace - useful for understanding
-    optimization dynamics and gradient flow.
+    optimization dynamics and gradient flow. Can analyze either raw gradients or momentum buffers.
 
     Args:
         model: PyTorch model
         param_name: Name of parameter to track. If None, auto-detects important conv layer.
+        optimizers: List of optimizers (required if use_momentum=True)
+        lr: Learning rate to scale by (used if scale_by_lr=True)
+        scale_by_lr: If True, scale all statistics by learning rate
+        use_momentum: If True, compute statistics of momentum buffers instead of raw gradients
 
     Returns:
         Dictionary containing:
-            - 'spectrum': Singular values of gradient (numpy array)
+            - 'spectrum': Singular values of gradient or momentum (numpy array)
             - 'frobenius_norm': Frobenius norm ||∇||_F
             - 'spectral_norm': Spectral norm (largest singular value) ||∇||_2
             - 'trace': Trace of gradient Gram matrix Tr(∇^T∇)
             - 'param_name': Name of the tracked parameter
 
     Example:
-        >>> # During training, after loss.backward()
+        >>> # Raw gradient statistics
         >>> grad_stats = compute_gradient_statistics(model, 'layers.0.conv1.weight')
-        >>> print(f"Gradient spectral norm: {grad_stats['spectral_norm']:.2e}")
-        >>> print(f"Condition number: {grad_stats['spectrum'][0] / grad_stats['spectrum'][-1]:.2f}")
+
+        >>> # Momentum buffer statistics
+        >>> grad_stats = compute_gradient_statistics(
+        ...     model, 'layers.0.conv1.weight', optimizers=opts, use_momentum=True
+        ... )
     """
     # Auto-detect parameter if not specified
     if param_name is None:
@@ -526,32 +540,68 @@ def compute_gradient_statistics(model: nn.Module, param_name: str = None) -> Dic
             param = p
             break
 
-    if param is None or param.grad is None:
+    if param is None:
         return {}
 
-    grad = param.grad.data
+    # Get the data to analyze (gradient or momentum buffer)
+    if use_momentum:
+        if optimizers is None:
+            raise ValueError("optimizers must be provided when use_momentum=True")
+
+        # Build mapping from parameter id to optimizer state
+        param_to_state = {}
+        for optimizer in optimizers:
+            for param_group in optimizer.param_groups:
+                for p in param_group['params']:
+                    if p in optimizer.state:
+                        param_to_state[id(p)] = optimizer.state[p]
+
+        # Get momentum buffer
+        state = param_to_state.get(id(param))
+        if state is None:
+            return {}
+
+        # Different optimizers store momentum under different keys
+        if 'momentum_buffer' in state:
+            data = state['momentum_buffer']
+        elif 'exp_avg' in state:
+            data = state['exp_avg']
+        else:
+            return {}
+    else:
+        if param.grad is None:
+            return {}
+        data = param.grad.data
 
     # Reshape to 2D if needed (conv layers are typically 4D: out_ch, in_ch, h, w)
-    if grad.ndim == 2:
-        grad_2d = grad
+    if data.ndim == 2:
+        data_2d = data
     else:
-        grad_2d = grad.reshape(grad.size(0), -1)
+        data_2d = data.reshape(data.size(0), -1)
 
     stats = {'param_name': param_name}
 
     try:
         # Move to CPU and convert to float32 for numerical stability
-        grad_cpu = grad_2d.cpu().float()
+        data_cpu = data_2d.cpu().float()
 
         # Compute SVD to get spectrum
-        _, s, _ = torch.svd(grad_cpu)
+        _, s, _ = torch.svd(data_cpu)
+
+        # Optionally scale by learning rate
+        if scale_by_lr:
+            s = s * lr
+            scale_factor = lr
+        else:
+            scale_factor = 1.0
+
         stats['spectrum'] = s.numpy()
 
         # Spectral norm (largest singular value)
         stats['spectral_norm'] = s[0].item()
 
         # Frobenius norm: ||G||_F = sqrt(sum of squared entries)
-        stats['frobenius_norm'] = torch.linalg.norm(grad_cpu, ord='fro').item()
+        stats['frobenius_norm'] = torch.linalg.norm(data_cpu, ord='fro').item() * scale_factor
 
         # Trace of Gram matrix: Tr(G^T G) = sum of squared singular values
         stats['trace'] = (s ** 2).sum().item()

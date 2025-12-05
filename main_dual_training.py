@@ -128,8 +128,8 @@ def main(
     print(f"  - Batch size: {batch_size}")
     print(f"  - Total steps: {total_train_steps}")
     print(f"  - Total epochs: {total_epochs}")
-    # weight_decay_misc = weight_decay_misc * batch_size
-    # weight_decay = weight_decay * batch_size
+    weight_decay_misc = weight_decay_misc * batch_size
+    weight_decay = weight_decay * batch_size
     
     print("\n[2/5] Creating Models...")
     models = {}
@@ -285,7 +285,16 @@ def main(
 
                 # Single-layer gradient statistics tracking (independent of gradient spectra)
                 if track_single_layer_gradients and step % svd_freq == 0 and gradient_track_param:
-                    grad_stats = compute_gradient_statistics(model, gradient_track_param)
+                    opts = optimizers_dict[model_name]
+                    filter_lr = opts[-1].param_groups[0]['lr']
+                    grad_stats = compute_gradient_statistics(
+                        model,
+                        gradient_track_param,
+                        optimizers=opts,
+                        lr=filter_lr,
+                        scale_by_lr=False,
+                        use_momentum=False  # Set to True to analyze momentum buffers instead
+                    )
                     gradient_statistics_logs[model_name].append((step, grad_stats))
 
                 for opt in optimizers_dict[model_name]:
