@@ -56,6 +56,8 @@ def main(
     save_results: bool = True,
     svd_freq: int = 20,
     total_train_steps: int = 400,
+    track_gradient_spectra: bool = False,  # Enable/disable all-layer gradient spectra tracking
+    track_single_layer_gradients: bool = False,  # Enable/disable single-layer gradient statistics tracking
 ):
 
     if optimizer_configs_str is not None:
@@ -263,7 +265,8 @@ def main(
                 
 
                 # Compute gradient statistics BEFORE optimizer step (captures raw gradients)
-                if step % svd_freq == 0:
+                # All-layer gradient spectra tracking
+                if track_gradient_spectra and step % svd_freq == 0:
                     # Get learning rate for filter parameters (from main optimizer)
                     opts = optimizers_dict[model_name]
                     # Filter params are in the last optimizer (main optimizer like Muon/Shampoo)
@@ -280,10 +283,10 @@ def main(
                     )
                     gradient_spectra_logs[model_name].append((step, grad_spectra))
 
-                    # Also compute for single important layer (if exists)
-                    if gradient_track_param:
-                        grad_stats = compute_gradient_statistics(model, gradient_track_param)
-                        gradient_statistics_logs[model_name].append((step, grad_stats))
+                # Single-layer gradient statistics tracking (independent of gradient spectra)
+                if track_single_layer_gradients and step % svd_freq == 0 and gradient_track_param:
+                    grad_stats = compute_gradient_statistics(model, gradient_track_param)
+                    gradient_statistics_logs[model_name].append((step, grad_stats))
 
                 for opt in optimizers_dict[model_name]:
                     opt.step()
@@ -309,13 +312,18 @@ def main(
             #         msg += f" + gradient stats"
             #     print(f"  [Step {step}] {msg}")
 
-            # Log gradient spectra computation
-            if step % svd_freq == 0:
-                num_layers = len(filter_param_names_dict[next(iter(models.keys()))])
-                msg = f"\n  [Step {step}] Recorded gradient spectra for {len(models)} models × {num_layers} layers"
-                if gradient_track_param:
-                    msg += f" + single-layer gradient stats"
-                print(msg)
+            # Log gradient tracking computation
+            if step % svd_freq == 0 and (track_gradient_spectra or track_single_layer_gradients):
+                msg_parts = []
+                if track_gradient_spectra:
+                    num_layers = len(filter_param_names_dict[next(iter(models.keys()))])
+                    msg_parts.append(f"gradient spectra for {len(models)} models × {num_layers} layers")
+                if track_single_layer_gradients and gradient_track_param:
+                    msg_parts.append(f"single-layer gradient stats")
+
+                if msg_parts:
+                    msg = f"\n  [Step {step}] Recorded " + " + ".join(msg_parts)
+                    print(msg)
             
             step += 1
             if step >= total_train_steps:
@@ -448,14 +456,15 @@ def main(
         #     with open(os.path.join(log_dir, f"singular_values_{safe_name}.pkl"), 'wb') as f:
         #         pickle.dump(singular_values_logs[model_name], f)
 
-        # Save gradient spectra for all filter layers
-        for model_name in models.keys():
-            safe_name = model_name.replace(".", "_").replace("/", "_")
-            with open(os.path.join(log_dir, f"gradient_spectra_{safe_name}.pkl"), 'wb') as f:
-                pickle.dump(gradient_spectra_logs[model_name], f)
+        # Save gradient spectra for all filter layers (if tracking enabled)
+        if track_gradient_spectra:
+            for model_name in models.keys():
+                safe_name = model_name.replace(".", "_").replace("/", "_")
+                with open(os.path.join(log_dir, f"gradient_spectra_{safe_name}.pkl"), 'wb') as f:
+                    pickle.dump(gradient_spectra_logs[model_name], f)
 
-        # Save single-layer gradient statistics (if tracked)
-        if gradient_track_param:
+        # Save single-layer gradient statistics (if tracking enabled and param exists)
+        if track_single_layer_gradients and gradient_track_param:
             for model_name in models.keys():
                 safe_name = model_name.replace(".", "_").replace("/", "_")
                 with open(os.path.join(log_dir, f"gradient_stats_{safe_name}.pkl"), 'wb') as f:
@@ -490,8 +499,9 @@ def main(
         print(f"  - Config: config.pt, README.md")
         print(f"  - Metrics: metrics_*.npy and metrics_*.json for each model")
         print(f"  - Detailed logger data: logger_data_*.pkl for each model (includes grad norms, etc.)")
-        print(f"  - Gradient spectra: gradient_spectra_*.pkl for each model (all filter layers)")
-        if gradient_track_param:
+        if track_gradient_spectra:
+            print(f"  - Gradient spectra: gradient_spectra_*.pkl for each model (all filter layers)")
+        if track_single_layer_gradients and gradient_track_param:
             print(f"  - Single-layer gradient statistics: gradient_stats_*.pkl for each model")
         print(f"  - Models: model_*.pt for each model")
     
