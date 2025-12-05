@@ -44,8 +44,8 @@ def main(
     data_path: str = "cifar10",
     dataset: str = "cifar10",  # 'cifar10', 'mnist', or 'fashion_mnist'
     batch_size: int = 2048,
-    lr_bias: float = 0.053,
-    lr_head: float = 0.067,
+    lr_bias: float = 0.001,
+    lr_head: float = 0.003,
     weight_decay: float = 1e-4,
     weight_decay_misc: float = 1e-4,
     batch_sweep_count: int = 20,

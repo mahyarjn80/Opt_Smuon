@@ -1405,12 +1405,12 @@ def create_optimizer(
             param_configs_adam.append(dict(
                 params=bias_params[:1],  # Whitening bias
                 lr=lr_bias,
-                weight_decay=weight_decay_misc/lr_bias
+                weight_decay=weight_decay_misc
             ))
             param_configs_adam.append(dict(
                 params=bias_params[1:],  # Other biases
                 lr=lr_bias,
-                weight_decay=weight_decay_misc/lr_bias
+                weight_decay=weight_decay_misc
             ))
         else:
             # Other architectures: single bias param group
@@ -1424,7 +1424,7 @@ def create_optimizer(
         param_configs_adam.append(dict(
             params=head_params,
             lr=lr_head,
-            weight_decay=weight_decay_misc/lr_head
+            weight_decay=weight_decay_misc
         ))
 
     if param_configs_adam:
