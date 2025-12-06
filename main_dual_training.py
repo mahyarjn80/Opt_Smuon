@@ -153,7 +153,6 @@ def main(
     print(f"  - Architecture: {arch.__class__.__name__}")
     print(f"  - Total parameters: {sum(p.numel() for p in base_model.parameters()):,}")
     print(f"  - Number of models: {len(models)}")
-    
 
     print("\n[3/5] Setting up Optimizers...")
     print(f"  - Using parameter grouping strategy: '{param_group_strategy}' (auto-detected from {arch.__class__.__name__})")
@@ -212,19 +211,25 @@ def main(
 
     print("\n[5/5] Training...")
     print_columns(DEFAULT_LOGGING_COLUMNS, is_head=True)
-    
+
+    # Reset RNG to initial seed to ensure deterministic data augmentation
+    # This ensures same config gets same data regardless of number of models created
+    torch.manual_seed(seed)
+    if device == "cuda":
+        torch.cuda.manual_seed(seed)
+    print(f"  - Reset RNG state for deterministic data augmentation")
+
     step = 0
 
-    
-    for epoch in range(total_epochs):
 
+    for epoch in range(total_epochs):
         for model in models.values():
             model.train()
-        
 
-        epoch_metrics = {name: {'loss': 0.0, 'correct': 0, 'samples': 0} 
+
+        epoch_metrics = {name: {'loss': 0.0, 'correct': 0, 'samples': 0}
                         for name in models.keys()}
-        
+
 
         for inputs, labels in train_loader:
             for model_name, model in models.items():
