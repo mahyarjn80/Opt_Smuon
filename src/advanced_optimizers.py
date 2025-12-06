@@ -995,12 +995,15 @@ class MuonSoftCoupled(torch.optim.Optimizer):
         weight_decay (float): weight decay (L2 penalty) (default: 0.0)
         ns_steps (int): Newton-Schulz iterations (default: 5)
         eps (float): epsilon for numerical stability in polar decomposition (default: 1e-7)
+        nuclear_norm_update_freq (int): how often to recompute nuclear norm scaling (default: 1)
+            Set to >1 to cache scaling factors and reduce computational cost
 
     Example:
         >>> optimizer = MuonSoftCoupled(
         ...     model.parameters(),
         ...     lr=0.0005,
-        ...     momentum=0.9
+        ...     momentum=0.9,
+        ...     nuclear_norm_update_freq=10  # Update scaling every 10 steps
         ... )
         >>> optimizer.zero_grad()
         >>> loss_fn(model(input), target).backward()
@@ -1010,6 +1013,7 @@ class MuonSoftCoupled(torch.optim.Optimizer):
         - Uses QDWH polar decomposition to compute nuclear norm
         - Works best with 2D+ parameters (weight matrices)
         - Automatically handles aspect ratio scaling
+        - For large models, set nuclear_norm_update_freq > 1 to improve speed
     """
 
     def __init__(
@@ -1021,6 +1025,7 @@ class MuonSoftCoupled(torch.optim.Optimizer):
         weight_decay: float = 0.0,
         ns_steps: int = 5,
         eps: float = 1e-7,
+        nuclear_norm_update_freq: int = 1,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -1030,6 +1035,8 @@ class MuonSoftCoupled(torch.optim.Optimizer):
             raise ValueError("Nesterov momentum requires a momentum value > 0")
         if eps <= 0.0:
             raise ValueError(f"Invalid epsilon value: {eps}")
+        if nuclear_norm_update_freq < 1:
+            raise ValueError(f"Invalid nuclear_norm_update_freq: {nuclear_norm_update_freq}")
 
         defaults = dict(
             lr=lr,
@@ -1038,6 +1045,7 @@ class MuonSoftCoupled(torch.optim.Optimizer):
             weight_decay=weight_decay,
             ns_steps=ns_steps,
             eps=eps,
+            nuclear_norm_update_freq=nuclear_norm_update_freq,
         )
         super(MuonSoftCoupled, self).__init__(params, defaults)
 
@@ -1056,6 +1064,7 @@ class MuonSoftCoupled(torch.optim.Optimizer):
             weight_decay = group['weight_decay']
             ns_steps = group['ns_steps']
             eps = group['eps']
+            update_freq = group['nuclear_norm_update_freq']
 
             for p in group['params']:
                 if p.grad is None:
@@ -1068,6 +1077,7 @@ class MuonSoftCoupled(torch.optim.Optimizer):
                 if len(state) == 0:
                     state['step'] = 0
                     state['momentum_buffer'] = torch.zeros_like(grad)
+                    state['cached_scale'] = None  # Cache for nuclear norm scaling
 
                 buf = state['momentum_buffer']
 
@@ -1089,19 +1099,29 @@ class MuonSoftCoupled(torch.optim.Optimizer):
                     # Reshape to matrix (first dim x product of rest)
                     update_2d = update.view(len(update), -1)
 
-                    # Compute nuclear norm via polar decomposition
-                    # polar returns (unitary, hermitian) when compute_hermitian=True
-                    _, h = polar(update_2d, method='qdwh', compute_hermitian=True, eps=eps)
-                    nuc_norm = torch.trace(h)
+                    # Compute/update scaling factor based on frequency
+                    should_update_scale = (state['step'] % update_freq == 0)
 
-                    # Compute Frobenius norm squared: ||G||_F² = trace(G^T G)
-                    frob_sq = torch.trace(update_2d.T @ update_2d)
+                    if should_update_scale or state['cached_scale'] is None:
+                        # Compute nuclear norm via polar decomposition
+                        # polar returns (unitary, hermitian) when compute_hermitian=True
+                        _, h = polar(update_2d, method='qdwh', compute_hermitian=True, eps=eps)
+                        nuc_norm = torch.trace(h)
 
-                    # Compute effective rank: r_eff = ||G||_nuc² / ||G||_F²
-                    r_eff = (nuc_norm ** 2) / (frob_sq + eps)
+                        # Compute Frobenius norm squared: ||G||_F² = trace(G^T G)
+                        frob_sq = torch.trace(update_2d.T @ update_2d)
 
-                    # Compute scaling factor: sqrt(||G||_nuc / r_eff)
-                    scale = torch.sqrt(nuc_norm / (r_eff + eps))
+                        # Compute effective rank: r_eff = ||G||_nuc² / ||G||_F²
+                        r_eff = (nuc_norm ** 2) / (frob_sq + eps)
+
+                        # Compute scaling factor: sqrt(||G||_nuc / r_eff)
+                        scale = torch.sqrt(nuc_norm / (r_eff + eps))
+
+                        # Cache the scaling factor
+                        state['cached_scale'] = scale.item()
+                    else:
+                        # Use cached scaling factor
+                        scale = state['cached_scale']
 
                     # Compute orthogonalization (Muon)
                     update_orth_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
@@ -1160,12 +1180,15 @@ class MuonFixedRank(torch.optim.Optimizer):
         weight_decay (float): weight decay (L2 penalty) (default: 0.0)
         ns_steps (int): Newton-Schulz iterations (default: 5)
         eps (float): epsilon for numerical stability in polar decomposition (default: 1e-7)
+        nuclear_norm_update_freq (int): how often to recompute nuclear norm scaling (default: 1)
+            Set to >1 to cache scaling factors and reduce computational cost
 
     Example:
         >>> optimizer = MuonFixedRank(
         ...     model.parameters(),
         ...     lr=0.0005,
-        ...     momentum=0.9
+        ...     momentum=0.9,
+        ...     nuclear_norm_update_freq=10  # Update scaling every 10 steps
         ... )
         >>> optimizer.zero_grad()
         >>> loss_fn(model(input), target).backward()
@@ -1175,6 +1198,7 @@ class MuonFixedRank(torch.optim.Optimizer):
         - Uses QDWH polar decomposition to compute nuclear norm
         - Works best with 2D+ parameters (weight matrices)
         - Automatically handles aspect ratio scaling
+        - For large models, set nuclear_norm_update_freq > 1 to improve speed
     """
 
     def __init__(
@@ -1186,6 +1210,7 @@ class MuonFixedRank(torch.optim.Optimizer):
         weight_decay: float = 0.0,
         ns_steps: int = 5,
         eps: float = 1e-7,
+        nuclear_norm_update_freq: int = 1,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -1195,6 +1220,8 @@ class MuonFixedRank(torch.optim.Optimizer):
             raise ValueError("Nesterov momentum requires a momentum value > 0")
         if eps <= 0.0:
             raise ValueError(f"Invalid epsilon value: {eps}")
+        if nuclear_norm_update_freq < 1:
+            raise ValueError(f"Invalid nuclear_norm_update_freq: {nuclear_norm_update_freq}")
 
         defaults = dict(
             lr=lr,
@@ -1203,6 +1230,7 @@ class MuonFixedRank(torch.optim.Optimizer):
             weight_decay=weight_decay,
             ns_steps=ns_steps,
             eps=eps,
+            nuclear_norm_update_freq=nuclear_norm_update_freq,
         )
         super(MuonFixedRank, self).__init__(params, defaults)
 
@@ -1221,6 +1249,7 @@ class MuonFixedRank(torch.optim.Optimizer):
             weight_decay = group['weight_decay']
             ns_steps = group['ns_steps']
             eps = group['eps']
+            update_freq = group['nuclear_norm_update_freq']
 
             for p in group['params']:
                 if p.grad is None:
@@ -1233,6 +1262,7 @@ class MuonFixedRank(torch.optim.Optimizer):
                 if len(state) == 0:
                     state['step'] = 0
                     state['momentum_buffer'] = torch.zeros_like(grad)
+                    state['cached_scale'] = None  # Cache for nuclear norm scaling
 
                 buf = state['momentum_buffer']
 
@@ -1254,16 +1284,26 @@ class MuonFixedRank(torch.optim.Optimizer):
                     # Reshape to matrix (first dim x product of rest)
                     update_2d = update.view(len(update), -1)
 
-                    # Compute nuclear norm via polar decomposition
-                    # polar returns (unitary, hermitian) when compute_hermitian=True
-                    _, h = polar(update_2d, method='qdwh', compute_hermitian=True, eps=eps)
-                    nuc_norm = torch.trace(h)
+                    # Compute/update scaling factor based on frequency
+                    should_update_scale = (state['step'] % update_freq == 0)
 
-                    # Compute r_max = min(matrix dimensions)
-                    r_max = min(update_2d.shape[0], update_2d.shape[1])
+                    if should_update_scale or state['cached_scale'] is None:
+                        # Compute nuclear norm via polar decomposition
+                        # polar returns (unitary, hermitian) when compute_hermitian=True
+                        _, h = polar(update_2d, method='qdwh', compute_hermitian=True, eps=eps)
+                        nuc_norm = torch.trace(h)
 
-                    # Compute scaling factor: sqrt(||G||_nuc) / r_max
-                    scale = torch.sqrt(nuc_norm + eps) / r_max
+                        # Compute r_max = min(matrix dimensions)
+                        r_max = min(update_2d.shape[0], update_2d.shape[1])
+
+                        # Compute scaling factor: sqrt(||G||_nuc) / r_max
+                        scale = torch.sqrt(nuc_norm + eps) / r_max
+
+                        # Cache the scaling factor
+                        state['cached_scale'] = scale.item()
+                    else:
+                        # Use cached scaling factor
+                        scale = state['cached_scale']
 
                     # Compute orthogonalization (Muon)
                     update_orth_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
