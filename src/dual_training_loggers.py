@@ -657,29 +657,49 @@ def compute_gradient_spectra(
     if use_momentum:
         if optimizers is None:
             raise ValueError("optimizers must be provided when use_momentum=True")
+
+        total_params = 0
+        params_with_state = 0
         for optimizer in optimizers:
             # Iterate through ALL parameter groups, not just the first one
             for param_group in optimizer.param_groups:
                 for param in param_group['params']:
+                    total_params += 1
                     if param in optimizer.state:
+                        params_with_state += 1
                         param_to_state[id(param)] = optimizer.state[param]
 
+                        # Check what keys this state has (only print once)
+                        if params_with_state == 1:
+                            state_keys = list(optimizer.state[param].keys())
+                            print(f"\n[DEBUG compute_gradient_spectra] First param has state keys: {state_keys}")
+
+        print(f"[DEBUG compute_gradient_spectra] Found {params_with_state}/{total_params} params with optimizer state")
+        print(f"[DEBUG compute_gradient_spectra] Trying to track {len(param_names)} param names: {param_names[:3]}...")  # Show first 3
+
     with torch.no_grad():
+        params_found = 0
+        params_with_momentum = 0
+
         for param_name in param_names:
             # Find the parameter
             param = None
             for name, p in model.named_parameters():
                 if name == param_name:
                     param = p
+                    params_found += 1
                     break
 
             if param is None:
+                if use_momentum:
+                    print(f"[DEBUG] Could not find parameter '{param_name}' in model.named_parameters()")
                 continue
 
             # Get the data to analyze (gradient or momentum buffer)
             if use_momentum:
                 state = param_to_state.get(id(param))
                 if state is None:
+                    print(f"[DEBUG] Parameter '{param_name}' not in param_to_state (id={id(param)})")
                     continue
 
                 # Different optimizers store momentum under different keys
@@ -687,9 +707,12 @@ def compute_gradient_spectra(
                 # Adam/AdamW: 'exp_avg' (first moment)
                 if 'momentum_buffer' in state:
                     data = state['momentum_buffer']
+                    params_with_momentum += 1
                 elif 'exp_avg' in state:
                     data = state['exp_avg']
+                    params_with_momentum += 1
                 else:
+                    print(f"[DEBUG] Parameter '{param_name}' has state but no momentum_buffer or exp_avg. Keys: {list(state.keys())}")
                     continue
             else:
                 if param.grad is None:
@@ -727,6 +750,10 @@ def compute_gradient_spectra(
             except Exception as e:
                 print(f"Warning: Could not compute gradient spectrum for {param_name}: {e}")
                 continue
+
+        if use_momentum:
+            print(f"[DEBUG compute_gradient_spectra] Summary: Found {params_found}/{len(param_names)} params, {params_with_momentum} with momentum buffers")
+            print(f"[DEBUG compute_gradient_spectra] Returning {len(gradient_spectra)} gradient spectra\n")
 
     return gradient_spectra
 
