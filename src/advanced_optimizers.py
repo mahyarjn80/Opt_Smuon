@@ -2045,26 +2045,26 @@ def create_optimizer(
             # CifarNet case: separate whitening bias from other biases
             param_configs_adam.append(dict(
                 params=bias_params[:1],  # Whitening bias
-                lr=config.lr,
+                lr=lr_bias,
                 weight_decay=weight_decay_misc
             ))
             param_configs_adam.append(dict(
                 params=bias_params[1:],  # Other biases
-                lr=config.lr,
+                lr=lr_bias,
                 weight_decay=weight_decay_misc
             ))
         else:
             # Other architectures: single bias param group
             param_configs_adam.append(dict(
                 params=bias_params,
-                lr=config.lr,
+                lr=lr_bias,
                 weight_decay=weight_decay_misc
             ))
 
     if len(head_params) > 0:
         param_configs_adam.append(dict(
             params=head_params,
-            lr=config.lr,
+            lr=lr_head,
             weight_decay=weight_decay_misc
         ))
 
