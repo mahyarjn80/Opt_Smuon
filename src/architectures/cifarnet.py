@@ -61,11 +61,6 @@ class CifarNetModule(nn.Module):
             nn.MaxPool2d(3),
         )
         self.head = nn.Linear(block3_width, output_dim, bias=False)
-        for mod in self.modules():
-            if isinstance(mod, BatchNorm):
-                mod.float()
-            else:
-                mod.half()
 
     def reset(self):
         for m in self.modules():
@@ -94,12 +89,12 @@ class CifarNetModule(nn.Module):
 @dataclass
 class CifarNet(Architecture):
     """CifarNet architecture from airbench.
-    
+
     A high-performance CNN designed for CIFAR-10 with:
     - Whitening preprocessing layer
     - Three ConvGroup blocks with increasing channels
     - Specialized BatchNorm with low momentum
-    - Mixed precision (half/float)
+    - Full float32 precision
     """
     block1_width: int = 64
     block2_width: int = 256

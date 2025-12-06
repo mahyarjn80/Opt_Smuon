@@ -236,8 +236,8 @@ def main(
                 else:
                     outputs = model(inputs)
                     
-                loss = F.cross_entropy(outputs, labels, 
-                                     label_smoothing=label_smoothing, reduction='sum')
+                loss = F.cross_entropy(outputs, labels,
+                                     label_smoothing=label_smoothing, reduction='mean')
                 loss.backward()
                 
 
@@ -305,7 +305,7 @@ def main(
 
 
                 with torch.no_grad():
-                    epoch_metrics[model_name]['loss'] += loss.item()
+                    epoch_metrics[model_name]['loss'] += loss.item() * len(inputs)
                     epoch_metrics[model_name]['correct'] += (outputs.argmax(1) == labels).float().sum().item()
                     epoch_metrics[model_name]['samples'] += len(inputs)
 

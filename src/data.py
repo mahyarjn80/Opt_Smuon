@@ -80,11 +80,11 @@ def batch_crop(images, crop_size):
 class CifarLoader:
     """
     High-performance CIFAR-10 data loader with optional augmentation.
-    
+
     Features:
     - Loads entire dataset to GPU for fast access
     - Supports horizontal flipping and random cropping
-    - Uses half precision (float16) for memory efficiency
+    - Uses full precision (float32) for numerical stability
     - Implements efficient every-other-epoch flipping scheme
     
     Args:
@@ -119,9 +119,9 @@ class CifarLoader:
         data = torch.load(data_path, map_location=torch.device(device))
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
         
-        # Convert to half precision and channels_last format for efficiency
-        # It's faster to load+process uint8 data than to load preprocessed fp16 data
-        self.images = (self.images.half() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
+        # Convert to float32 and channels_last format
+        # Using full precision for numerical stability
+        self.images = (self.images.float() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
         
         # Normalization transform
         self.normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
@@ -195,7 +195,7 @@ class MNISTLoader:
     Features:
     - Loads entire dataset to GPU for fast access
     - Supports horizontal flipping and random cropping
-    - Uses half precision (float16) for memory efficiency
+    - Uses full precision (float32) for numerical stability
     - Works with both MNIST and Fashion-MNIST
 
     Args:
@@ -244,9 +244,9 @@ class MNISTLoader:
         data = torch.load(data_path, map_location=torch.device(device))
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
 
-        # Convert to half precision and add channel dimension
+        # Convert to float32 and add channel dimension
         # MNIST images are grayscale: [N, 28, 28] -> [N, 1, 28, 28]
-        self.images = (self.images.half() / 255).unsqueeze(1).to(memory_format=torch.channels_last)
+        self.images = (self.images.float() / 255).unsqueeze(1).to(memory_format=torch.channels_last)
 
         # Normalization transform
         self.normalize = T.Normalize(mean, std)
@@ -308,7 +308,7 @@ class MNISTLoader:
         # Generate batch indices (shuffled or sequential)
         indices = (torch.randperm if self.shuffle else torch.arange)(len(images), device=images.device)
 
-        # Yield batches (convert to float32 for compatibility with all model types)
+        # Yield batches (already in float32)
         for i in range(len(self)):
             idxs = indices[i*self.batch_size:(i+1)*self.batch_size]
-            yield (images[idxs].float(), self.labels[idxs])
+            yield (images[idxs], self.labels[idxs])

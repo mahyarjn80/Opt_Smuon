@@ -1417,7 +1417,7 @@ def create_optimizer(
             param_configs_adam.append(dict(
                 params=bias_params,
                 lr=lr_bias,
-                weight_decay=weight_decay_misc/lr_bias
+                weight_decay=weight_decay_misc
             ))
 
     if len(head_params) > 0:

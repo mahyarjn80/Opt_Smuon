@@ -40,9 +40,6 @@ def evaluate(model: nn.Module, loader, device: str = 'cuda', batch_size: int = 2
         # For CifarLoader-style loaders (images already on device)
         if hasattr(loader, 'normalize') and hasattr(loader, 'images'):
             test_images = loader.normalize(loader.images)
-            # Convert to float32 only for MNIST/Fashion-MNIST (MNISTLoader stores as half precision)
-            if hasattr(loader, 'mean'):  # MNISTLoader has this attribute
-                test_images = test_images.float()
             labels = loader.labels
             
             # Process in batches to avoid memory issues
@@ -110,9 +107,6 @@ def evaluate_with_label_smoothing(
         # For CifarLoader-style loaders
         if hasattr(loader, 'normalize') and hasattr(loader, 'images'):
             test_images = loader.normalize(loader.images)
-            # Convert to float32 only for MNIST/Fashion-MNIST (MNISTLoader stores as half precision)
-            if hasattr(loader, 'mean'):  # MNISTLoader has this attribute
-                test_images = test_images.float()
             labels = loader.labels
             
             for i in range(0, len(test_images), batch_size):
