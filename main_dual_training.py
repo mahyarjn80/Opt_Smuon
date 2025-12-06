@@ -56,7 +56,7 @@ def main(
     save_results: bool = True,
     svd_freq: int = 20,
     total_train_steps: int = 400,
-    track_gradient_spectra: bool = False,  # Enable/disable all-layer gradient spectra tracking
+    track_gradient_spectra: bool = True,  # Enable/disable all-layer gradient spectra tracking
     track_single_layer_gradients: bool = False,  # Enable/disable single-layer gradient statistics tracking
 ):
 
@@ -279,7 +279,7 @@ def main(
                         optimizers=opts,
                         lr=filter_lr,
                         scale_by_lr=False,
-                        use_momentum=False  # Set to True to analyze momentum buffers instead
+                        use_momentum=True  # Set to True to analyze momentum buffers instead
                     )
                     gradient_spectra_logs[model_name].append((step, grad_spectra))
 
