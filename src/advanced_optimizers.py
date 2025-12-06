@@ -1,10 +1,14 @@
 """
-Advanced optimizers (Shampoo, Muon, MuonRemez, Adam) implemented as PyTorch optimizers.
+Advanced optimizers (Shampoo, Muon, MuonRemez, MuonSoftCoupled, MuonFixedRank, Adam) implemented as PyTorch optimizers.
 
 This module provides:
 - Shampoo: Full-matrix preconditioning optimizer
 - Muon: Gradient orthogonalization optimizer
 - MuonRemez: Muon variant using coupled Newton-Schulz for matrix square root (Σ^(1/2))
+- MuonResidual: Muon with gradient residual regularization
+- MuonSoftCoupled: Muon with nuclear norm scaling based on effective rank
+- MuonFixedRank: Muon with nuclear norm scaling based on maximum rank
+- HybridMuonRemez: Blends Muon and MuonRemez with configurable schedule
 - Adam: Adaptive moment estimation optimizer (AdamW variant)
 - Configuration classes and utilities for creating optimizers
 """
@@ -19,6 +23,7 @@ import torch
 import torch.optim
 
 from src.coupled_ns import compute_u_sigma_half_vt
+from polar import polar
 
 
 Array = Any
@@ -959,6 +964,335 @@ class MuonResidual(torch.optim.Optimizer):
 
 
 #############################################
+#        MuonSoftCoupled Optimizer          #
+#############################################
+
+class MuonSoftCoupled(torch.optim.Optimizer):
+    r"""Muon optimizer with soft-coupled nuclear norm scaling.
+
+    This optimizer extends Muon by scaling the orthogonalized update with a
+    factor based on the nuclear norm and effective rank of the momentum buffer.
+
+    Update rule:
+        v_t = β v_{t-1} + (1-β) g_t                          (momentum)
+        u_orth = NS_zeroth_power(v_t)                        (orthogonalize)
+        ||v_t||_nuc = trace(H) from polar decomposition     (nuclear norm)
+        ||v_t||_F² = trace(v_t^T v_t)                       (Frobenius norm squared)
+        r_eff = ||v_t||_nuc² / ||v_t||_F²                   (effective rank)
+        scale = sqrt(||v_t||_nuc / r_eff)                   (scaling factor)
+        u_t = scale * u_orth                                 (scaled update)
+        W ← (1 - η*wd) W - η u_t                            (update)
+
+    The scaling factor √(||G||_nuc)/√(r_eff) adaptively adjusts based on the
+    effective rank of the gradient, providing stronger updates when the gradient
+    has lower effective rank.
+
+    Arguments:
+        params (iterable): parameters to optimize
+        lr (float): learning rate (default: 1e-3)
+        momentum (float): momentum factor (default: 0.9)
+        nesterov (bool): whether to use Nesterov momentum (default: True)
+        weight_decay (float): weight decay (L2 penalty) (default: 0.0)
+        ns_steps (int): Newton-Schulz iterations (default: 5)
+        eps (float): epsilon for numerical stability in polar decomposition (default: 1e-7)
+
+    Example:
+        >>> optimizer = MuonSoftCoupled(
+        ...     model.parameters(),
+        ...     lr=0.0005,
+        ...     momentum=0.9
+        ... )
+        >>> optimizer.zero_grad()
+        >>> loss_fn(model(input), target).backward()
+        >>> optimizer.step()
+
+    Note:
+        - Uses QDWH polar decomposition to compute nuclear norm
+        - Works best with 2D+ parameters (weight matrices)
+        - Automatically handles aspect ratio scaling
+    """
+
+    def __init__(
+        self,
+        params: Iterable[torch.Tensor],
+        lr: float = 1e-3,
+        momentum: float = 0.9,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+        ns_steps: int = 5,
+        eps: float = 1e-7,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if momentum < 0.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+        if nesterov and momentum <= 0:
+            raise ValueError("Nesterov momentum requires a momentum value > 0")
+        if eps <= 0.0:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+            ns_steps=ns_steps,
+            eps=eps,
+        )
+        super(MuonSoftCoupled, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step with nuclear norm scaling."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            nesterov = group['nesterov']
+            weight_decay = group['weight_decay']
+            ns_steps = group['ns_steps']
+            eps = group['eps']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.data
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['momentum_buffer'] = torch.zeros_like(grad)
+
+                buf = state['momentum_buffer']
+
+                # Update momentum buffer: v_t = β v_{t-1} + (1-β) g_t
+                buf.lerp_(grad, 1 - momentum)
+
+                # Get update (with Nesterov if enabled)
+                if nesterov:
+                    update = grad.lerp(buf, momentum)
+                    # Bias correction for Nesterov
+                    bias_correction = 1.0 / (1 - momentum ** (state['step'] + 2))
+                else:
+                    update = buf.clone()
+                    # Bias correction
+                    bias_correction = 1.0 / (1 - momentum ** (state['step'] + 1))
+
+                # Apply nuclear norm scaling with orthogonalization
+                if len(grad.shape) >= 2:
+                    # Reshape to matrix (first dim x product of rest)
+                    update_2d = update.view(len(update), -1)
+
+                    # Compute nuclear norm via polar decomposition
+                    # polar returns (unitary, hermitian) when compute_hermitian=True
+                    _, h = polar(update_2d, method='qdwh', compute_hermitian=True, eps=eps)
+                    nuc_norm = torch.trace(h)
+
+                    # Compute Frobenius norm squared: ||G||_F² = trace(G^T G)
+                    frob_sq = torch.trace(update_2d.T @ update_2d)
+
+                    # Compute effective rank: r_eff = ||G||_nuc² / ||G||_F²
+                    r_eff = (nuc_norm ** 2) / (frob_sq + eps)
+
+                    # Compute scaling factor: sqrt(||G||_nuc / r_eff)
+                    scale = torch.sqrt(nuc_norm / (r_eff + eps))
+
+                    # Compute orthogonalization (Muon)
+                    update_orth_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
+
+                    # Scale the orthogonalized update
+                    update_scaled_2d = scale * update_orth_2d
+
+                    # Reshape back
+                    update_scaled = update_scaled_2d.view(update.shape)
+
+                    # Scale by aspect ratio (from original Muon paper)
+                    aspect_ratio = max(1, grad.size(-2) / grad.size(-1))
+                    update_scaled *= aspect_ratio ** 0.5
+                else:
+                    # For 1D parameters, just use the update as-is
+                    update_scaled = update
+
+                state['step'] += 1
+
+                # Apply weight decay (decoupled)
+                p.data.mul_(1 - lr * weight_decay)
+
+                # Apply update
+                p.data.add_(update_scaled, alpha=-lr)
+
+        return loss
+
+
+#############################################
+#        MuonFixedRank Optimizer            #
+#############################################
+
+class MuonFixedRank(torch.optim.Optimizer):
+    r"""Muon optimizer with fixed-rank nuclear norm scaling.
+
+    This optimizer extends Muon by scaling the orthogonalized update with a
+    factor based on the nuclear norm and the maximum possible rank.
+
+    Update rule:
+        v_t = β v_{t-1} + (1-β) g_t                          (momentum)
+        u_orth = NS_zeroth_power(v_t)                        (orthogonalize)
+        ||v_t||_nuc = trace(H) from polar decomposition     (nuclear norm)
+        r_max = min(matrix dimensions)                       (maximum rank)
+        scale = sqrt(||v_t||_nuc) / r_max                   (scaling factor)
+        u_t = scale * u_orth                                 (scaled update)
+        W ← (1 - η*wd) W - η u_t                            (update)
+
+    The scaling factor √(||G||_nuc)/r_max provides a normalized scaling based
+    on the nuclear norm relative to the maximum possible rank.
+
+    Arguments:
+        params (iterable): parameters to optimize
+        lr (float): learning rate (default: 1e-3)
+        momentum (float): momentum factor (default: 0.9)
+        nesterov (bool): whether to use Nesterov momentum (default: True)
+        weight_decay (float): weight decay (L2 penalty) (default: 0.0)
+        ns_steps (int): Newton-Schulz iterations (default: 5)
+        eps (float): epsilon for numerical stability in polar decomposition (default: 1e-7)
+
+    Example:
+        >>> optimizer = MuonFixedRank(
+        ...     model.parameters(),
+        ...     lr=0.0005,
+        ...     momentum=0.9
+        ... )
+        >>> optimizer.zero_grad()
+        >>> loss_fn(model(input), target).backward()
+        >>> optimizer.step()
+
+    Note:
+        - Uses QDWH polar decomposition to compute nuclear norm
+        - Works best with 2D+ parameters (weight matrices)
+        - Automatically handles aspect ratio scaling
+    """
+
+    def __init__(
+        self,
+        params: Iterable[torch.Tensor],
+        lr: float = 1e-3,
+        momentum: float = 0.9,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+        ns_steps: int = 5,
+        eps: float = 1e-7,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if momentum < 0.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+        if nesterov and momentum <= 0:
+            raise ValueError("Nesterov momentum requires a momentum value > 0")
+        if eps <= 0.0:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+            ns_steps=ns_steps,
+            eps=eps,
+        )
+        super(MuonFixedRank, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step with fixed-rank nuclear norm scaling."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            nesterov = group['nesterov']
+            weight_decay = group['weight_decay']
+            ns_steps = group['ns_steps']
+            eps = group['eps']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.data
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['momentum_buffer'] = torch.zeros_like(grad)
+
+                buf = state['momentum_buffer']
+
+                # Update momentum buffer: v_t = β v_{t-1} + (1-β) g_t
+                buf.lerp_(grad, 1 - momentum)
+
+                # Get update (with Nesterov if enabled)
+                if nesterov:
+                    update = grad.lerp(buf, momentum)
+                    # Bias correction for Nesterov
+                    bias_correction = 1.0 / (1 - momentum ** (state['step'] + 2))
+                else:
+                    update = buf.clone()
+                    # Bias correction
+                    bias_correction = 1.0 / (1 - momentum ** (state['step'] + 1))
+
+                # Apply fixed-rank nuclear norm scaling with orthogonalization
+                if len(grad.shape) >= 2:
+                    # Reshape to matrix (first dim x product of rest)
+                    update_2d = update.view(len(update), -1)
+
+                    # Compute nuclear norm via polar decomposition
+                    # polar returns (unitary, hermitian) when compute_hermitian=True
+                    _, h = polar(update_2d, method='qdwh', compute_hermitian=True, eps=eps)
+                    nuc_norm = torch.trace(h)
+
+                    # Compute r_max = min(matrix dimensions)
+                    r_max = min(update_2d.shape[0], update_2d.shape[1])
+
+                    # Compute scaling factor: sqrt(||G||_nuc) / r_max
+                    scale = torch.sqrt(nuc_norm + eps) / r_max
+
+                    # Compute orthogonalization (Muon)
+                    update_orth_2d = zeropower_via_newtonschulz5(update_2d, steps=ns_steps)
+
+                    # Scale the orthogonalized update
+                    update_scaled_2d = scale * update_orth_2d
+
+                    # Reshape back
+                    update_scaled = update_scaled_2d.view(update.shape)
+
+                    # Scale by aspect ratio (from original Muon paper)
+                    aspect_ratio = max(1, grad.size(-2) / grad.size(-1))
+                    update_scaled *= aspect_ratio ** 0.5
+                else:
+                    # For 1D parameters, just use the update as-is
+                    update_scaled = update
+
+                state['step'] += 1
+
+                # Apply weight decay (decoupled)
+                p.data.mul_(1 - lr * weight_decay)
+
+                # Apply update
+                p.data.add_(update_scaled, alpha=-lr)
+
+        return loss
+
+
+#############################################
 #             Adam Optimizer                #
 #############################################
 
@@ -1166,6 +1500,40 @@ class AdamConfig:
 
 
 @dataclass
+class MuonSoftCoupledConfig:
+    """Configuration for MuonSoftCoupled optimizer.
+
+    Attributes:
+        lr: Learning rate
+        momentum: Momentum factor for gradient smoothing
+        eps: Epsilon for numerical stability in polar decomposition
+    """
+    lr: float = 0.0005
+    momentum: float = 0.9
+    eps: float = 1e-7
+
+    def __str__(self):
+        return f"MuonSoftCoupled_lr{self.lr}_mom{self.momentum}"
+
+
+@dataclass
+class MuonFixedRankConfig:
+    """Configuration for MuonFixedRank optimizer.
+
+    Attributes:
+        lr: Learning rate
+        momentum: Momentum factor for gradient smoothing
+        eps: Epsilon for numerical stability in polar decomposition
+    """
+    lr: float = 0.0005
+    momentum: float = 0.9
+    eps: float = 1e-7
+
+    def __str__(self):
+        return f"MuonFixedRank_lr{self.lr}_mom{self.momentum}"
+
+
+@dataclass
 class HybridMuonRemezConfig:
     """Configuration for HybridMuonRemez optimizer.
 
@@ -1254,7 +1622,16 @@ class HybridMuonRemezConfig:
 
 
 # Type alias for optimizer configurations
-OptimizerConfig = Union[MuonConfig, MuonRemezConfig, MuonResidualConfig, ShampooConfig, AdamConfig, HybridMuonRemezConfig]
+OptimizerConfig = Union[
+    MuonConfig,
+    MuonRemezConfig,
+    MuonResidualConfig,
+    MuonSoftCoupledConfig,
+    MuonFixedRankConfig,
+    ShampooConfig,
+    AdamConfig,
+    HybridMuonRemezConfig
+]
 
 
 def parse_optimizer_config(config_str: str) -> OptimizerConfig:
@@ -1272,6 +1649,12 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
 
         >>> parse_optimizer_config("MuonResidual:lr=0.0005,momentum=0.9,gamma=0.1")
         MuonResidualConfig(lr=0.0005, momentum=0.9, gamma=0.1)
+
+        >>> parse_optimizer_config("MuonSoftCoupled:lr=0.0005,momentum=0.9")
+        MuonSoftCoupledConfig(lr=0.0005, momentum=0.9)
+
+        >>> parse_optimizer_config("MuonFixedRank:lr=0.0005,momentum=0.9")
+        MuonFixedRankConfig(lr=0.0005, momentum=0.9)
 
         >>> parse_optimizer_config("Shampoo:lr=0.0005,momentum=0.9,order_multiplier=2")
         ShampooConfig(lr=0.0005, momentum=0.9, order_multiplier=2)
@@ -1331,6 +1714,10 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
         return MuonRemezConfig(**params)
     elif opt_type == 'muonresidual':
         return MuonResidualConfig(**params)
+    elif opt_type == 'muonsoftcoupled':
+        return MuonSoftCoupledConfig(**params)
+    elif opt_type == 'muonfixedrank':
+        return MuonFixedRankConfig(**params)
     elif opt_type == 'shampoo':
         return ShampooConfig(**params)
     elif opt_type == 'adam':
@@ -1340,7 +1727,8 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
     else:
         raise ValueError(
             f"Unknown optimizer type: {opt_type}. "
-            f"Valid types: 'muon', 'muonremez', 'muonresidual', 'shampoo', 'adam', 'hybridmuonremez'"
+            f"Valid types: 'muon', 'muonremez', 'muonresidual', 'muonsoftcoupled', 'muonfixedrank', "
+            f"'shampoo', 'adam', 'hybridmuonremez'"
         )
 
 
@@ -1438,7 +1826,7 @@ def create_optimizer(
         )
         optimizers.append(adam_opt)
 
-    # Create main optimizer for filter params (Shampoo, Muon, MuonRemez, MuonResidual, or HybridMuonRemez)
+    # Create main optimizer for filter params (Shampoo, Muon, MuonRemez, MuonResidual, MuonSoftCoupled, MuonFixedRank, or HybridMuonRemez)
     if len(filter_params) > 0:
         if isinstance(config, MuonConfig):
             main_opt = Muon(
@@ -1466,6 +1854,26 @@ def create_optimizer(
                 nesterov=True,
                 weight_decay=weight_decay,
                 gamma=config.gamma
+            )
+            optimizers.append(main_opt)
+        elif isinstance(config, MuonSoftCoupledConfig):
+            main_opt = MuonSoftCoupled(
+                filter_params,
+                lr=config.lr,
+                momentum=config.momentum,
+                nesterov=True,
+                weight_decay=weight_decay,
+                eps=config.eps
+            )
+            optimizers.append(main_opt)
+        elif isinstance(config, MuonFixedRankConfig):
+            main_opt = MuonFixedRank(
+                filter_params,
+                lr=config.lr,
+                momentum=config.momentum,
+                nesterov=True,
+                weight_decay=weight_decay,
+                eps=config.eps
             )
             optimizers.append(main_opt)
         elif isinstance(config, ShampooConfig):
@@ -1496,7 +1904,8 @@ def create_optimizer(
         else:
             raise ValueError(
                 f"Unknown optimizer config: {type(config)}. "
-                f"Expected MuonConfig, MuonRemezConfig, MuonResidualConfig, ShampooConfig, or HybridMuonRemezConfig."
+                f"Expected MuonConfig, MuonRemezConfig, MuonResidualConfig, MuonSoftCoupledConfig, "
+                f"MuonFixedRankConfig, ShampooConfig, or HybridMuonRemezConfig."
             )
 
     return optimizers
