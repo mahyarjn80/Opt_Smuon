@@ -2050,21 +2050,21 @@ def create_optimizer(
             ))
             param_configs_adam.append(dict(
                 params=bias_params[1:],  # Other biases
-                lr=onfig.lr,
+                lr=config.lr,
                 weight_decay=weight_decay_misc
             ))
         else:
             # Other architectures: single bias param group
             param_configs_adam.append(dict(
                 params=bias_params,
-                lr=onfig.lr,
+                lr=config.lr,
                 weight_decay=weight_decay_misc
             ))
 
     if len(head_params) > 0:
         param_configs_adam.append(dict(
             params=head_params,
-            lr=onfig.lr,
+            lr=config.lr,
             weight_decay=weight_decay_misc
         ))
 
