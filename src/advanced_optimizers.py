@@ -3,6 +3,7 @@ Advanced optimizers (Shampoo, Muon, MuonRemez, MuonSoftCoupled, MuonFixedRank, A
 
 This module provides:
 - Shampoo: Full-matrix preconditioning optimizer
+- ShampooNS: Shampoo with Newton-Schulz orthogonalization
 - Muon: Gradient orthogonalization optimizer
 - MuonRemez: Muon variant using coupled Newton-Schulz for matrix square root (Σ^(1/2))
 - MuonResidual: Muon with gradient residual regularization
@@ -1333,6 +1334,201 @@ class MuonFixedRank(torch.optim.Optimizer):
 
 
 #############################################
+#          ShampooNS Optimizer              #
+#############################################
+
+class ShampooNS(torch.optim.Optimizer):
+    r"""Implements Shampoo with Newton-Schulz Orthogonalization.
+
+    This optimizer combines:
+    - Shampoo's full-matrix preconditioning along each dimension
+    - Newton-Schulz orthogonalization applied after preconditioning
+
+    The algorithm first applies Shampoo's preconditioners to the momentum update,
+    then applies Newton-Schulz orthogonalization to the preconditioned result.
+
+    Arguments:
+        params (iterable): iterable of parameters to optimize or dicts defining
+            parameter groups
+        lr (float): learning rate (default: 1e-1)
+        momentum (float): momentum factor (default: 0.0)
+        weight_decay (float): weight decay (L2 penalty) (default: 0.0)
+        epsilon (float): epsilon added to preconditioners for numerical stability
+            (default: 1e-4)
+        update_freq (int): update frequency to compute inverse (default: 1)
+        order_multiplier (int): multiplier for matrix power (default: 2)
+        nesterov (bool): whether to use Nesterov momentum (default: True)
+        ns_steps (int): number of Newton-Schulz iterations (default: 5)
+
+    Example:
+        >>> optimizer = ShampooNS(model.parameters(), lr=0.01)
+        >>> optimizer.zero_grad()
+        >>> loss_fn(model(input), target).backward()
+        >>> optimizer.step()
+
+    Note:
+        This combines Shampoo's preconditioning with Muon's orthogonalization,
+        potentially providing benefits of both approaches.
+    """
+
+    def __init__(
+        self,
+        params: Iterable[torch.Tensor],
+        lr: float = 1e-1,
+        momentum: float = 0.0,
+        weight_decay: float = 0.0,
+        epsilon: float = 1e-4,
+        update_freq: int = 1,
+        order_multiplier: int = 2,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+    ):
+        if lr <= 0.0:
+            raise ValueError(f'Invalid learning rate: {lr}')
+        if momentum < 0.0:
+            raise ValueError(f'Invalid momentum value: {momentum}')
+        if weight_decay < 0.0:
+            raise ValueError(f'Invalid weight_decay value: {weight_decay}')
+        if epsilon < 0.0:
+            raise ValueError(f'Invalid epsilon value: {epsilon}')
+        if update_freq < 1:
+            raise ValueError(f'Invalid update_freq value: {update_freq}')
+        if ns_steps < 1:
+            raise ValueError(f'Invalid ns_steps value: {ns_steps}')
+
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            epsilon=epsilon,
+            update_freq=update_freq,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+        )
+        self.order_multiplier = order_multiplier
+        super(ShampooNS, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.data
+                order = grad.ndimension()
+                original_size = grad.size()
+                state = self.state[p]
+                momentum = group['momentum']
+                weight_decay = group['weight_decay']
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    if momentum > 0:
+                        state['momentum_buffer'] = grad.clone()
+                    for dim_id, dim in enumerate(grad.size()):
+                        # Precondition matrices (Gram matrices)
+                        state[f'precond_{dim_id}'] = group['epsilon'] * torch.eye(
+                            dim, device=grad.device, dtype=torch.float32
+                        )
+                        state[f'inv_precond_{dim_id}'] = torch.zeros(
+                            dim, dim, device=grad.device, dtype=torch.float32
+                        )
+
+                # Update momentum buffer
+                if momentum > 0:
+                    state['momentum_buffer'].lerp_(grad, 1 - momentum)
+
+                # Get update (with Nesterov if enabled)
+                if momentum > 0:
+                    if group['nesterov']:
+                        update = grad.lerp(state['momentum_buffer'], momentum)
+                    else:
+                        update = state['momentum_buffer']
+                else:
+                    update = grad
+
+                update32 = update.to(torch.float32)
+
+                # Apply Shampoo preconditioning along each dimension
+                for dim_id, dim in enumerate(grad.size()):
+                    precond = state[f'precond_{dim_id}']
+                    inv_precond = state[f'inv_precond_{dim_id}']
+
+                    # For Gram matrix computation: transpose grad (no in-place mutation)
+                    grad_transposed = grad.transpose(0, dim_id).contiguous()
+                    grad_flat = grad_transposed.view(dim, -1)
+                    g32 = grad_flat.to(torch.float32)
+                    g32_t = g32.t()
+
+                    # Transpose update32 to bring dimension dim_id to front (in-place is fine here)
+                    update32 = update32.transpose_(0, dim_id).contiguous()
+                    transposed_size = update32.size()
+                    update32 = update32.view(dim, -1)
+
+                    precond.add_(g32 @ g32_t)
+
+                    # Recompute matrix inverse periodically
+                    if state['step'] % group['update_freq'] == 0:
+                        power = order * self.order_multiplier
+                        inv_precond.copy_(_matrix_power(precond, power))
+
+                    # Apply preconditioning
+                    if dim_id == order - 1:
+                        # Last dimension: apply from left
+                        update32 = update32.t() @ inv_precond
+                        # Reshape back to original but STAY in float32 for NS
+                        update32 = update32.view(original_size)
+                    else:
+                        # Intermediate dimensions: apply from right
+                        update32 = inv_precond @ update32
+                        # Reshape for next iteration but STAY in float32
+                        update32 = update32.view(transposed_size)
+
+                # Now apply Newton-Schulz orthogonalization on the preconditioned update
+                if len(grad.shape) >= 2:
+                    # Reshape to 2D matrix
+                    update_2d = update32.view(update32.size(0), -1)
+
+                    # Apply Newton-Schulz orthogonalization
+                    update_orth_2d = zeropower_via_newtonschulz5(update_2d, steps=group['ns_steps'])
+
+                    # Reshape back
+                    update_orth = update_orth_2d.view(original_size)
+
+                    # Scale by aspect ratio (from Muon)
+                    aspect_ratio = max(1, grad.size(-2) / grad.size(-1))
+                    update_orth *= aspect_ratio ** 0.5
+
+                    # Convert back to original dtype
+                    final_update = update_orth.to(grad.dtype)
+                else:
+                    # For 1D parameters, just use the preconditioned update
+                    final_update = update32.to(grad.dtype)
+
+                state['step'] += 1
+
+                # Apply weight decay
+                p.data.mul_(1 - group['lr'] * group['weight_decay'])
+                # Apply update
+                p.data.add_(final_update, alpha=-group['lr'])
+
+        return loss
+
+
+#############################################
 #             Adam Optimizer                #
 #############################################
 
@@ -1507,7 +1703,7 @@ class MuonResidualConfig:
 @dataclass
 class ShampooConfig:
     """Configuration for Shampoo optimizer.
-    
+
     Attributes:
         lr: Learning rate
         momentum: Momentum factor for gradient smoothing
@@ -1517,9 +1713,27 @@ class ShampooConfig:
     momentum: float = 0.9
     order_multiplier: int = 2
 
-
     def __str__(self):
         return f"Shampoo_lr{self.lr}_mom{self.momentum}_order{self.order_multiplier}"
+
+
+@dataclass
+class ShampooNSConfig:
+    """Configuration for ShampooNS optimizer.
+
+    Attributes:
+        lr: Learning rate
+        momentum: Momentum factor for gradient smoothing
+        order_multiplier: Multiplier for matrix power (power = -1/(order*multiplier))
+        ns_steps: Number of Newton-Schulz iterations
+    """
+    lr: float = 0.0005
+    momentum: float = 0.9
+    order_multiplier: int = 2
+    ns_steps: int = 5
+
+    def __str__(self):
+        return f"ShampooNS_lr{self.lr}_mom{self.momentum}_order{self.order_multiplier}_ns{self.ns_steps}"
 
 
 @dataclass
@@ -1665,6 +1879,7 @@ OptimizerConfig = Union[
     MuonSoftCoupledConfig,
     MuonFixedRankConfig,
     ShampooConfig,
+    ShampooNSConfig,
     AdamConfig,
     HybridMuonRemezConfig
 ]
@@ -1756,6 +1971,8 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
         return MuonFixedRankConfig(**params)
     elif opt_type == 'shampoo':
         return ShampooConfig(**params)
+    elif opt_type == 'shampoons':
+        return ShampooNSConfig(**params)
     elif opt_type == 'adam':
         return AdamConfig(**params)
     elif opt_type == 'hybridmuonremez' or opt_type == 'hybrid':
@@ -1764,7 +1981,7 @@ def parse_optimizer_config(config_str: str) -> OptimizerConfig:
         raise ValueError(
             f"Unknown optimizer type: {opt_type}. "
             f"Valid types: 'muon', 'muonremez', 'muonresidual', 'muonsoftcoupled', 'muonfixedrank', "
-            f"'shampoo', 'adam', 'hybridmuonremez'"
+            f"'shampoo', 'shampoons', 'adam', 'hybridmuonremez'"
         )
 
 
@@ -1783,7 +2000,7 @@ def create_optimizer(
     Create optimizer instances based on configuration.
 
     This function creates separate optimizers for different parameter groups:
-    - Filter/weight parameters use the specified optimizer (Muon, MuonRemez, Shampoo, or HybridMuonRemez)
+    - Filter/weight parameters use the specified optimizer (Muon, MuonRemez, Shampoo, ShampooNS, or HybridMuonRemez)
     - Biases and head/embedding parameters ALWAYS use Adam (with default settings)
 
     For CifarNet, the Adam optimizer has 3 param groups:
@@ -1862,7 +2079,7 @@ def create_optimizer(
         )
         optimizers.append(adam_opt)
 
-    # Create main optimizer for filter params (Shampoo, Muon, MuonRemez, MuonResidual, MuonSoftCoupled, MuonFixedRank, or HybridMuonRemez)
+    # Create main optimizer for filter params (Shampoo, ShampooNS, Muon, MuonRemez, MuonResidual, MuonSoftCoupled, MuonFixedRank, or HybridMuonRemez)
     if len(filter_params) > 0:
         if isinstance(config, MuonConfig):
             main_opt = Muon(
@@ -1919,6 +2136,16 @@ def create_optimizer(
                 order_multiplier=config.order_multiplier
             )
             optimizers.append(main_opt)
+        elif isinstance(config, ShampooNSConfig):
+            main_opt = ShampooNS(
+                filter_params,
+                lr=config.lr,
+                momentum=config.momentum,
+                weight_decay=weight_decay,
+                order_multiplier=config.order_multiplier,
+                ns_steps=config.ns_steps
+            )
+            optimizers.append(main_opt)
         elif isinstance(config, HybridMuonRemezConfig):
             if total_train_steps is None:
                 raise ValueError("total_train_steps is required for HybridMuonRemezConfig")
@@ -1939,7 +2166,7 @@ def create_optimizer(
             raise ValueError(
                 f"Unknown optimizer config: {type(config)}. "
                 f"Expected MuonConfig, MuonRemezConfig, MuonResidualConfig, MuonSoftCoupledConfig, "
-                f"MuonFixedRankConfig, ShampooConfig, or HybridMuonRemezConfig."
+                f"MuonFixedRankConfig, ShampooConfig, ShampooNSConfig, or HybridMuonRemezConfig."
             )
 
     return optimizers
