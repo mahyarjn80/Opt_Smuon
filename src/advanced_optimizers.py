@@ -1506,11 +1506,9 @@ class MuonSoftCoupledConfig:
     Attributes:
         lr: Learning rate
         momentum: Momentum factor for gradient smoothing
-        eps: Epsilon for numerical stability in polar decomposition
     """
     lr: float = 0.0005
     momentum: float = 0.9
-    eps: float = 1e-7
 
     def __str__(self):
         return f"MuonSoftCoupled_lr{self.lr}_mom{self.momentum}"
@@ -1523,11 +1521,9 @@ class MuonFixedRankConfig:
     Attributes:
         lr: Learning rate
         momentum: Momentum factor for gradient smoothing
-        eps: Epsilon for numerical stability in polar decomposition
     """
     lr: float = 0.0005
     momentum: float = 0.9
-    eps: float = 1e-7
 
     def __str__(self):
         return f"MuonFixedRank_lr{self.lr}_mom{self.momentum}"
@@ -1862,8 +1858,7 @@ def create_optimizer(
                 lr=config.lr,
                 momentum=config.momentum,
                 nesterov=True,
-                weight_decay=weight_decay,
-                eps=config.eps
+                weight_decay=weight_decay
             )
             optimizers.append(main_opt)
         elif isinstance(config, MuonFixedRankConfig):
@@ -1872,8 +1867,7 @@ def create_optimizer(
                 lr=config.lr,
                 momentum=config.momentum,
                 nesterov=True,
-                weight_decay=weight_decay,
-                eps=config.eps
+                weight_decay=weight_decay
             )
             optimizers.append(main_opt)
         elif isinstance(config, ShampooConfig):

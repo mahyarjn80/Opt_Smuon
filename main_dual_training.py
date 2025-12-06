@@ -488,6 +488,7 @@ def main(
         readme_content = f"""# Multi-Model Training Experiment
 
 ## Configuration
+-Dataset: {dataset}
 - Architecture: {arch.__class__.__name__}
 - Total Parameters: {sum(p.numel() for p in base_model.parameters()):,}
 - Batch Size: {batch_size}
