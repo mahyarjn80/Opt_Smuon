@@ -542,7 +542,7 @@ class MuonRemez(torch.optim.Optimizer):
         momentum: float = 0.0,
         nesterov: bool = False,
         weight_decay: float = 0.0,
-        ns_steps: int = 5,
+        ns_steps: int = 7,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
