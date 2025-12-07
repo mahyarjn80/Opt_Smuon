@@ -26,11 +26,13 @@ from src.dual_training_loggers import (
 from src.data import CifarLoader, MNISTLoader, CIFAR_MEAN, CIFAR_STD, MNIST_MEAN, MNIST_STD, FASHION_MNIST_MEAN, FASHION_MNIST_STD
 from src.eval import evaluate
 from src.param_groups import get_param_groups
-# os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-# torch.backends.cudnn.allow_tf32 = False
-# torch.backends.cuda.matmul.allow_tf32 = False
-# torch.set_float32_matmul_precision("highest")
-torch.backends.cudnn.benchmark = True
+# Enable full deterministic mode to ensure reproducibility
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # Required for deterministic cuBLAS
+torch.backends.cudnn.allow_tf32 = False              # Disable TF32 for determinism
+torch.backends.cuda.matmul.allow_tf32 = False        # Disable TF32 in matmul
+torch.set_float32_matmul_precision("highest")        # Highest precision for matmul
+torch.backends.cudnn.benchmark = False               # Disable benchmark mode (causes non-determinism)
+torch.use_deterministic_algorithms(True)             # Force all algorithms to be deterministic
 
 
 
