@@ -615,8 +615,11 @@ class MuonRemez(torch.optim.Optimizer):
                     update_2d = update.view(len(update), -1)
 
                     # Apply coupled Newton-Schulz to compute U·Σ^(1/2)·V^T
+                    # update_sqrt_2d = compute_u_sigma_half_vt(
+                    #     update_2d, steps=ns_steps, variant='muon_aggressive'
+                    # )
                     update_sqrt_2d = compute_u_sigma_half_vt(
-                        update_2d, steps=ns_steps, variant='muon_aggressive'
+                        update_2d, steps=ns_steps, variant='higham'
                     )
 
                     # Reshape back
